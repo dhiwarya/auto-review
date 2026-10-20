@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import type { Finding, JobDetail, Severity } from '../../../src/types.ts';
-import { getJson, postJson, useStream, useTick } from '../api.ts';
+import type { Finding, Job, JobDetail, PostPreview, ReviewMode, Severity } from '../../../src/types.ts';
+import { getJson, postJson, sendJson, useStream, useTick } from '../api.ts';
 import { clockTime, compact, duration, Progress, SeverityChip, shortSha, StateBadge, timeAgo } from '../ui.tsx';
 
 const SEV_ORDER: Record<Severity, number> = { blocker: 0, major: 1, minor: 2, nit: 3 };
@@ -51,12 +51,98 @@ function FindingCard({ f }: { f: Finding }) {
   );
 }
 
+// Confirms and posts a dry-run review to the PR.
+function PostPanel({ job, onClose }: { job: Job; onClose: () => void }) {
+  const [preview, setPreview] = useState<PostPreview | null>(null);
+  const [mode, setMode] = useState<ReviewMode>(job.mode);
+  const [error, setError] = useState<string | null>(null);
+  const [posting, setPosting] = useState(false);
+
+  useEffect(() => {
+    getJson<PostPreview>(`/api/jobs/${job.id}/post`)
+      .then((p) => {
+        setPreview(p);
+        setMode(p.defaultMode);
+      })
+      .catch((e) => setError(String(e.message ?? e)));
+  }, [job.id]);
+
+  const post = async () => {
+    setPosting(true);
+    setError(null);
+    try {
+      await sendJson('POST', `/api/jobs/${job.id}/post`, { mode });
+      onClose();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+      setPosting(false);
+    }
+  };
+
+  const moved = preview && preview.currentSha !== preview.reviewedSha;
+  const labels = preview
+    ? [preview.doneLabel, ...(preview.blockerLabel && (mode === 'publish' || preview.blockerLabelInDraft) ? [preview.blockerLabel] : [])]
+    : [];
+
+  return (
+    <div className="post-panel">
+      <strong>
+        Post this review to {job.repo}#{job.pr_number}
+      </strong>
+      {!preview && !error && <div className="small muted">Checking the PR…</div>}
+      {preview && (
+        <>
+          <div className="post-modes" role="radiogroup" aria-label="How to post">
+            <label className={`post-mode ${mode === 'draft' ? 'active' : ''}`}>
+              <input type="radio" name="mode" checked={mode === 'draft'} onChange={() => setMode('draft')} />
+              <span>
+                <strong>Draft</strong>
+                <span className="small muted block">A pending review only you can see. You edit it and submit it on GitHub.</span>
+              </span>
+            </label>
+            <label className={`post-mode ${mode === 'publish' ? 'active' : ''}`}>
+              <input type="radio" name="mode" checked={mode === 'publish'} onChange={() => setMode('publish')} />
+              <span>
+                <strong>Publish</strong>
+                <span className="small muted block">Posted now as a comment review under your name, visible to the author and everyone on the repo.</span>
+              </span>
+            </label>
+          </div>
+          <div className="small">
+            Posts {preview.inline} inline comment{preview.inline === 1 ? '' : 's'}
+            {preview.inSummary ? ` and ${preview.inSummary} finding${preview.inSummary === 1 ? '' : 's'} in the summary` : ''}, and adds the label
+            {labels.length > 1 ? 's' : ''} {labels.map((l) => <code key={l}>{l} </code>)}
+          </div>
+          {moved && (
+            <div className="small warn-text">
+              The PR has new commits since this review ({shortSha(preview.reviewedSha)} → {shortSha(preview.currentSha)}). Comments go on the
+              reviewed commit and may show as outdated.
+            </div>
+          )}
+        </>
+      )}
+      {error && <div className="small error">{error}</div>}
+      <div className="row">
+        <button className="btn btn-ghost" onClick={onClose} disabled={posting}>
+          Cancel
+        </button>
+        {preview && (
+          <button className="btn" onClick={post} disabled={posting}>
+            {posting ? 'Posting…' : mode === 'draft' ? 'Post draft' : 'Publish review'}
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
 export function JobView({ id }: { id: number }) {
   useTick(5000);
   const [detail, setDetail] = useState<JobDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [showDropped, setShowDropped] = useState(false);
   const [showPreview, setShowPreview] = useState(false);
+  const [showPost, setShowPost] = useState(false);
   const refetchTimer = useRef<number | null>(null);
 
   const load = useCallback(() => {
@@ -147,6 +233,11 @@ export function JobView({ id }: { id: number }) {
         {job.state === 'skipped' && <div className="small muted">{job.skip_reason}</div>}
 
         <div className="actions">
+          {job.dry_run === 1 && job.state === 'done' && job.review_state === 'DRY_RUN' && !showPost && (
+            <button className="btn" onClick={() => setShowPost(true)}>
+              Post to GitHub…
+            </button>
+          )}
           {job.review_url && (
             <a className="btn" href={`${job.pr_url}/files`} target="_blank" rel="noreferrer">
               {job.mode === 'draft' ? 'Open your draft on GitHub ↗' : 'Open the review on GitHub ↗'}
@@ -173,6 +264,10 @@ export function JobView({ id }: { id: number }) {
             The draft is only visible to you. Edit or delete comments in the Files changed tab, then submit it. This page
             learns what you kept for the leaderboard.
           </p>
+        )}
+        {showPost && <PostPanel job={job} onClose={() => setShowPost(false)} />}
+        {job.dry_run === 1 && job.state === 'done' && job.review_state === 'DRY_RUN' && !showPost && (
+          <p className="small muted">This was a dry run, so nothing was posted. You can post it now as a draft or a published review.</p>
         )}
         {showPreview && job.review_body && <pre className="preview">{job.review_body}</pre>}
       </section>

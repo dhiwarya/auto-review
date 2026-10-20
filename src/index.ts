@@ -37,7 +37,7 @@ const pipeline = new ReviewPipeline(gh, cfg, db, router, cache);
 const worker = new Worker(db, cfg, pipeline);
 const sync = new OutcomeSync(gh, cfg, db);
 const poller = new Poller(gh, cfg, db, worker, sync);
-const app = await startServer({ cfg, port, db, gh, router, worker, poller });
+const app = await startServer({ cfg, port, db, gh, router, worker, poller, pipeline });
 
 worker.start();
 poller.start();
@@ -47,10 +47,20 @@ console.log(`  dashboard: http://127.0.0.1:${port}`);
 console.log(`  repos: ${cfg.needsSetup ? 'none yet (add them in Settings)' : cfg.repos.allow.join(', ')}`);
 console.log(`  mode: ${cfg.defaultMode}${cfg.dryRun ? ' (DRY RUN: nothing is posted to GitHub)' : ''}`);
 
+// Ctrl+C stops the app: reviews in progress go back to the queue and resume on the next
+// start. A second Ctrl+C, or a stop that takes longer than 5 seconds, exits immediately.
 let stopping = false;
 async function shutdown() {
-  if (stopping) return;
+  if (stopping) {
+    console.log('Stopping now.');
+    process.exit(1);
+  }
   stopping = true;
+  console.log('Stopping… (press Ctrl+C again to force)');
+  setTimeout(() => {
+    console.log('Took too long to stop cleanly; exiting.');
+    process.exit(1);
+  }, 5000).unref();
   poller.stop();
   worker.stop();
   await app.close();

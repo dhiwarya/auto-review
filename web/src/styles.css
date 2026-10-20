@@ -856,3 +856,41 @@ select:focus {
     grid-template-columns: 1fr;
   }
 }
+
+.post-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px;
+  border: 1px solid var(--accent);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+  max-width: 720px;
+}
+.post-modes {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+.post-mode {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  cursor: pointer;
+}
+.post-mode.active {
+  border-color: var(--accent);
+}
+.post-mode input {
+  margin-top: 3px;
+  accent-color: var(--accent);
+}
+@media (max-width: 860px) {
+  .post-modes {
+    grid-template-columns: 1fr;
+  }
+}

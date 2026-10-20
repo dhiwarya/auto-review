@@ -7,9 +7,9 @@ import type { Checkout, RepoCache } from '../git/mirror.ts';
 import type { GitHub } from '../github/client.ts';
 import { addLabel, removeLabel } from '../github/labels.ts';
 import { getPr } from '../github/prs.ts';
-import { postReview, type InlineComment } from '../github/publish.ts';
+import { PendingReviewExists, postReview, type InlineComment } from '../github/publish.ts';
 import { NoProviderAvailable, type Router } from '../llm/router.ts';
-import type { Finding, Job, Provider } from '../types.ts';
+import type { Finding, Job, PostPreview, Provider, ReviewMode } from '../types.ts';
 import { buildContext, type ReviewContext } from './context.ts';
 import { inlineBody, summaryBody } from './format.ts';
 import { mainInstructions, securityInstructions, verifyInstructions } from './prompts.ts';
@@ -18,6 +18,11 @@ import { lowerSeverity, minSeverity, placeFindings, type Candidate } from './val
 
 // The job no longer needs doing: PR closed, or new commits replaced it.
 export class JobObsolete extends Error {}
+
+// Posting a dry-run review isn't possible right now; the message says why.
+export class PostRefused extends Error {}
+
+
 
 export class ReviewPipeline {
   private readonly gh: GitHub;
@@ -244,14 +249,9 @@ export class ReviewPipeline {
   }
 
   private async publish(job: Job, findings: Finding[]) {
-    const posted = findings.filter((f) => f.status !== 'dropped');
-    const hasBlocker = posted.some((f) => f.severity === 'blocker');
-    const inline: InlineComment[] = posted
-      .filter((f) => f.status === 'inline' && f.line !== null)
-      .map((f) => ({ findingId: f.id, path: f.file, line: f.line!, body: inlineBody(f) }));
-
     if (job.dry_run) {
-      this.step(job, `Dry run: would post a ${job.mode} review with ${inline.length} inline comment(s)`, 100);
+      const inline = findings.filter((f) => f.status === 'inline' && f.line !== null).length;
+      this.step(job, `Dry run: not posted. Ready to post a ${job.mode} review with ${inline} inline comment(s)`, 100);
       this.db.setState(job.id, 'done', { review_state: 'DRY_RUN', progress: 100 });
       return;
     }
@@ -259,26 +259,100 @@ export class ReviewPipeline {
     // Last check before speaking for you: don't post on a commit that's already outdated.
     const pr = await getPr(this.gh, job.repo, job.pr_number);
     if (pr.headSha !== job.head_sha) throw new JobObsolete(`superseded by new commits (${pr.headSha.slice(0, 7)})`);
+    await this.post(job, findings, job.mode);
+  }
 
-    this.step(job, job.mode === 'draft' ? 'Posting draft review (only you can see it)' : 'Posting review comment', 95);
-    const res = await postReview(this.gh, job.repo, job.pr_number, job.head_sha, job.mode, job.review_body ?? '', inline);
+  // Sends a prepared review to GitHub on the reviewed commit, as a pending draft or a
+  // published comment review, and sets the labels.
+  private async post(job: Job, findings: Finding[], mode: ReviewMode) {
+    const posted = findings.filter((f) => f.status !== 'dropped');
+    const hasBlocker = posted.some((f) => f.severity === 'blocker');
+    const inline: InlineComment[] = posted
+      .filter((f) => f.status === 'inline' && f.line !== null)
+      .map((f) => ({ findingId: f.id, path: f.file, line: f.line!, body: inlineBody(f) }));
+
+    this.step(job, mode === 'draft' ? 'Posting draft review (only you can see it)' : 'Posting review comment', 95);
+    const res = await postReview(this.gh, job.repo, job.pr_number, job.head_sha, mode, job.review_body ?? '', inline);
     if (res.droppedInline) {
       this.db.event(job.id, 'GitHub rejected an inline comment position, so every finding went into the review body instead', 'warn');
       for (const f of inline) this.db.updateFinding(f.findingId, { status: 'summary' });
     }
     for (const [findingId, commentId] of res.commentIds) this.db.updateFinding(findingId, { comment_id: commentId });
-    for (const f of posted) this.db.updateFinding(f.id, { outcome: job.mode === 'draft' ? 'pending' : 'published' });
+    for (const f of posted) this.db.updateFinding(f.id, { outcome: mode === 'draft' ? 'pending' : 'published' });
 
-    const labelOk = await this.labelFinish(job, hasBlocker);
+    const labelOk = await this.labelFinish({ ...job, mode }, hasBlocker);
     this.db.setState(job.id, 'done', {
+      mode,
+      dry_run: 0, // from here on it's a real review: follow-ups build on it and kept comments are tracked
       review_id: res.id,
       review_url: res.url,
       review_state: res.state,
       label_ok: labelOk ? 1 : 0,
       progress: 100,
-      step: job.mode === 'draft' ? 'Draft review ready for you on GitHub' : 'Review posted',
+      step: mode === 'draft' ? 'Draft review ready for you on GitHub' : 'Review posted',
     });
     this.db.event(job.id, `Review ${res.state.toLowerCase()} with ${res.commentIds.size} inline comment(s): ${res.url}`);
+  }
+
+  // ---- posting a dry-run review from the dashboard
+
+  private readonly posting = new Set<number>();
+
+  private postable(id: number): Job {
+    const job = this.db.job(id);
+    if (!job) throw new PostRefused('Review not found');
+    if (!job.dry_run || job.review_id) throw new PostRefused('This review is already on GitHub');
+    if (job.state !== 'done' || job.review_state !== 'DRY_RUN') throw new PostRefused('Only finished dry-run reviews can be posted');
+    if (!this.cfg.isRepoAllowed(job.repo)) throw new PostRefused('This repo is no longer in your repos list');
+    if (this.posting.has(id)) throw new PostRefused('Already posting this review');
+    return job;
+  }
+
+  // What posting would do, checked against the PR as it is now.
+  async previewPost(id: number): Promise<PostPreview> {
+    const job = this.postable(id);
+    const pr = await getPr(this.gh, job.repo, job.pr_number);
+    if (pr.state !== 'open') throw new PostRefused('This PR is no longer open');
+    const findings = this.db.findings(id).filter((f) => f.status !== 'dropped');
+    return {
+      inline: findings.filter((f) => f.status === 'inline' && f.line !== null).length,
+      inSummary: findings.filter((f) => f.status === 'summary' || (f.status === 'inline' && f.line === null)).length,
+      reviewedSha: job.head_sha,
+      currentSha: pr.headSha,
+      defaultMode: this.cfg.modeFor(job.repo),
+      doneLabel: this.cfg.labelName('done'),
+      blockerLabel: findings.some((f) => f.severity === 'blocker') ? this.cfg.labelName('blocker') : null,
+      blockerLabelInDraft: this.cfg.labels.blockerLabelInDraft,
+    };
+  }
+
+  async postDryRun(id: number, mode: ReviewMode): Promise<Job> {
+    const job = this.postable(id);
+    this.posting.add(id);
+    try {
+      const pr = await getPr(this.gh, job.repo, job.pr_number);
+      if (pr.state !== 'open') throw new PostRefused('This PR is no longer open');
+      this.db.event(id, `Posting to GitHub from the dashboard as a ${mode === 'draft' ? 'draft' : 'published review'}`);
+      if (pr.headSha !== job.head_sha) {
+        this.db.event(
+          id,
+          `The PR moved on to ${pr.headSha.slice(0, 7)}; comments go on the reviewed commit ${job.head_sha.slice(0, 7)} and may show as outdated`,
+          'warn',
+        );
+      }
+      await this.post(job, this.db.findings(id), mode);
+      return this.db.job(id)!;
+    } catch (err) {
+      // Put the review back as it was, ready to try again.
+      this.db.updateJob(id, { step: 'Dry run: not posted', progress: 100 });
+      if (err instanceof PendingReviewExists) {
+        throw new PostRefused('You already have an unsubmitted review on this PR. Submit or discard it on GitHub, then try again.');
+      }
+      if (!(err instanceof PostRefused)) this.db.event(id, `Posting failed: ${err instanceof Error ? err.message : err}`, 'error');
+      throw err;
+    } finally {
+      this.posting.delete(id);
+    }
   }
 
   private async labelStart(job: Job) {

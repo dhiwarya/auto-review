@@ -191,3 +191,15 @@ export interface Leaderboard {
 export type StreamMessage =
   | { type: 'job'; job: Job }
   | { type: 'overview'; overview: Overview };
+
+// What posting a dry-run review would do, checked against the PR as it is now.
+export interface PostPreview {
+  inline: number;
+  inSummary: number;
+  reviewedSha: string;
+  currentSha: string;
+  defaultMode: ReviewMode;
+  doneLabel: string;
+  blockerLabel: string | null;
+  blockerLabelInDraft: boolean;
+}

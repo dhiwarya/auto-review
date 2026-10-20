@@ -11,6 +11,7 @@ import { getPr } from '../github/prs.ts';
 import type { Poller } from '../jobs/poller.ts';
 import type { Worker } from '../jobs/worker.ts';
 import type { Router } from '../llm/router.ts';
+import { PostRefused, type ReviewPipeline } from '../review/pipeline.ts';
 import type { Job, JobDetail, JobState, LeaderboardKind, Overview, StreamMessage } from '../types.ts';
 import { leaderboard } from './leaderboard.ts';
 
@@ -22,6 +23,7 @@ interface Deps {
   router: Router;
   worker: Worker;
   poller: Poller;
+  pipeline: ReviewPipeline;
 }
 
 const WEB_DIST = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../web/dist');
@@ -62,7 +64,8 @@ function parsePrRef(input: string): { repo: string; number: number } | null {
 
 export async function startServer(deps: Deps) {
   const { cfg, db, gh, worker, poller } = deps;
-  const app = Fastify({ logger: false });
+  // The dashboard holds a live-updates connection open; closing must not wait for it.
+  const app = Fastify({ logger: false, forceCloseConnections: true });
   const port = deps.port;
   const allowedHosts = new Set([`127.0.0.1:${port}`, `localhost:${port}`, `[::1]:${port}`]);
 
@@ -112,6 +115,25 @@ export async function startServer(deps: Deps) {
   app.post<{ Params: { id: string } }>('/api/jobs/:id/cancel', async (req) => {
     worker.cancel(Number(req.params.id), 'cancelled from the dashboard');
     return { ok: true };
+  });
+
+  // Posting a dry-run review: first what it would do, then doing it.
+  app.get<{ Params: { id: string } }>('/api/jobs/:id/post', async (req, reply) => {
+    try {
+      return await deps.pipeline.previewPost(Number(req.params.id));
+    } catch (err) {
+      return reply.code(err instanceof PostRefused ? 409 : 500).send({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post<{ Params: { id: string }; Body: { mode?: string } }>('/api/jobs/:id/post', async (req, reply) => {
+    const mode = req.body?.mode;
+    if (mode !== 'draft' && mode !== 'publish') return reply.code(400).send({ error: 'mode must be draft or publish' });
+    try {
+      return await deps.pipeline.postDryRun(Number(req.params.id), mode);
+    } catch (err) {
+      return reply.code(err instanceof PostRefused ? 409 : 500).send({ error: err instanceof Error ? err.message : String(err) });
+    }
   });
 
   app.post('/api/poll', async () => {
