@@ -1,0 +1,191 @@
+import { httpStatus, splitRepo, type GitHub } from './client.ts';
+
+export interface RequestedPr {
+  repo: string; // owner/name
+  number: number;
+  updatedAt: string; // changes on new commits, edits, labels and comments
+}
+
+export interface PrInfo {
+  repo: string;
+  number: number;
+  title: string;
+  body: string;
+  url: string;
+  author: string;
+  draft: boolean;
+  state: string;
+  headSha: string;
+  baseSha: string;
+  headRef: string;
+  baseRef: string;
+  additions: number;
+  deletions: number;
+  changedFiles: number;
+  requestedReviewers: string[];
+}
+
+export interface PrFile {
+  filename: string;
+  previousFilename?: string;
+  status: string;
+  additions: number;
+  deletions: number;
+  patch?: string;
+}
+
+export interface LinkedIssue {
+  repo: string;
+  number: number;
+  title: string;
+  body: string;
+  url: string;
+  comments: { author: string; body: string }[];
+}
+
+// PRs where you personally (not one of your teams) are a requested reviewer.
+export async function searchRequestedPrs(gh: GitHub): Promise<RequestedPr[]> {
+  const q = 'is:pr is:open user-review-requested:@me -is:draft archived:false';
+  const items = await gh.octokit.paginate('GET /search/issues', { q, per_page: 100 });
+  return items.map((it) => {
+    const repo = it.repository_url.replace('https://api.github.com/repos/', '');
+    return { repo, number: it.number, updatedAt: it.updated_at };
+  });
+}
+
+export async function getPr(gh: GitHub, repo: string, number: number): Promise<PrInfo> {
+  const { data } = await gh.octokit.rest.pulls.get({ ...splitRepo(repo), pull_number: number });
+  return {
+    repo,
+    number,
+    title: data.title,
+    body: data.body ?? '',
+    url: data.html_url,
+    author: data.user?.login ?? 'unknown',
+    draft: Boolean(data.draft),
+    state: data.state,
+    headSha: data.head.sha,
+    baseSha: data.base.sha,
+    headRef: data.head.ref,
+    baseRef: data.base.ref,
+    additions: data.additions,
+    deletions: data.deletions,
+    changedFiles: data.changed_files,
+    requestedReviewers: (data.requested_reviewers ?? []).map((u) => u.login),
+  };
+}
+
+export async function listPrFiles(gh: GitHub, repo: string, number: number): Promise<PrFile[]> {
+  const files = await gh.octokit.paginate(gh.octokit.rest.pulls.listFiles, {
+    ...splitRepo(repo),
+    pull_number: number,
+    per_page: 100,
+  });
+  return files.map((f) => ({
+    filename: f.filename,
+    previousFilename: f.previous_filename,
+    status: f.status,
+    additions: f.additions,
+    deletions: f.deletions,
+    patch: f.patch,
+  }));
+}
+
+// Files changed between the last reviewed commit and the new head. Returns null when the
+// branch was rebased or force-pushed, in which case the caller falls back to a full review.
+export async function compareCommits(gh: GitHub, repo: string, since: string, head: string): Promise<PrFile[] | null> {
+  try {
+    const { data } = await gh.octokit.rest.repos.compareCommitsWithBasehead({
+      ...splitRepo(repo),
+      basehead: `${since}...${head}`,
+      per_page: 100,
+    });
+    if (data.status !== 'ahead') return null;
+    return (data.files ?? []).map((f) => ({
+      filename: f.filename,
+      previousFilename: f.previous_filename,
+      status: f.status,
+      additions: f.additions,
+      deletions: f.deletions,
+      patch: f.patch,
+    }));
+  } catch (err) {
+    if (httpStatus(err) === 404) return null;
+    throw err;
+  }
+}
+
+const ISSUE_REF = /(?:^|[\s(,])(?:([\w.-]+\/[\w.-]+))?#(\d+)\b|https:\/\/github\.com\/([\w.-]+\/[\w.-]+)\/issues\/(\d+)/g;
+
+// Issues the PR closes (GitHub's own link), plus issues mentioned in the description.
+export async function getLinkedIssues(gh: GitHub, pr: PrInfo, limit = 5): Promise<LinkedIssue[]> {
+  const refs = new Map<string, { repo: string; number: number }>();
+  const { owner, repo: name } = splitRepo(pr.repo);
+
+  try {
+    const res = await gh.octokit.graphql<{
+      repository: { pullRequest: { closingIssuesReferences: { nodes: { number: number; repository: { nameWithOwner: string } }[] } } };
+    }>(
+      `query($owner: String!, $name: String!, $number: Int!) {
+        repository(owner: $owner, name: $name) {
+          pullRequest(number: $number) {
+            closingIssuesReferences(first: 10) { nodes { number repository { nameWithOwner } } }
+          }
+        }
+      }`,
+      { owner, name, number: pr.number },
+    );
+    for (const n of res.repository.pullRequest.closingIssuesReferences.nodes) {
+      refs.set(`${n.repository.nameWithOwner}#${n.number}`, { repo: n.repository.nameWithOwner, number: n.number });
+    }
+  } catch {
+    // GraphQL can be unavailable for some tokens; description references still work.
+  }
+
+  for (const m of pr.body.matchAll(ISSUE_REF)) {
+    const repo = m[3] ?? m[1] ?? pr.repo;
+    const number = Number(m[4] ?? m[2]);
+    if (number && number !== pr.number) refs.set(`${repo}#${number}`, { repo, number });
+  }
+
+  const issues: LinkedIssue[] = [];
+  for (const ref of [...refs.values()].slice(0, limit * 2)) {
+    if (issues.length >= limit) break;
+    try {
+      const { data } = await gh.octokit.rest.issues.get({ ...splitRepo(ref.repo), issue_number: ref.number });
+      if (data.pull_request) continue; // a PR reference, not an issue
+      const { data: comments } = await gh.octokit.rest.issues.listComments({
+        ...splitRepo(ref.repo),
+        issue_number: ref.number,
+        per_page: 10,
+      });
+      issues.push({
+        repo: ref.repo,
+        number: ref.number,
+        title: data.title,
+        body: data.body ?? '',
+        url: data.html_url,
+        comments: comments.map((c) => ({ author: c.user?.login ?? 'unknown', body: c.body ?? '' })),
+      });
+    } catch {
+      // No access to that repo, or the number isn't an issue. Skip it.
+    }
+  }
+  return issues;
+}
+
+// Contributor guidelines, read from the base commit so the PR can't rewrite them.
+export async function getGuidelines(gh: GitHub, repo: string, baseSha: string): Promise<{ path: string; text: string }[]> {
+  const out: { path: string; text: string }[] = [];
+  for (const p of ['CLAUDE.md', 'AGENTS.md', 'CONTRIBUTING.md', '.github/CONTRIBUTING.md']) {
+    try {
+      const { data } = await gh.octokit.rest.repos.getContent({ ...splitRepo(repo), path: p, ref: baseSha });
+      if (!Array.isArray(data) && data.type === 'file' && 'content' in data) {
+        out.push({ path: p, text: Buffer.from(data.content, 'base64').toString('utf8') });
+      }
+    } catch {
+      // Not present.
+    }
+  }
+  return out;
+}

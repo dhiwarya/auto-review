@@ -1,0 +1,37 @@
+{
+  "repos": {
+    "allow": ["your-org/*", "your-username/some-repo"],
+    "deny": []
+  },
+  "dryRun": true,
+  "defaultMode": "draft",
+  "repoModes": {},
+  "models": {
+    "main": { "provider": "claude", "model": "opus", "fallback": "codex" },
+    "security": { "provider": "codex", "model": null, "fallback": "claude" },
+    "crossVerify": true,
+    "claudeEffort": null
+  },
+  "schedule": {
+    "pollIntervalSec": 5,
+    "syncIntervalSec": 60,
+    "maxReviewsPerHour": 6,
+    "concurrency": 1,
+    "pauseBetween": null,
+    "quotaBackoffMin": 30
+  },
+  "limits": {
+    "largePrLines": 1500,
+    "maxDiffChars": 200000,
+    "maxNits": 5,
+    "passTimeoutSec": 900,
+    "claudeMaxTurns": 60,
+    "maxAttempts": 3
+  },
+  "labels": {
+    "prefix": "ai-review",
+    "blockerLabelInDraft": false
+  },
+  "server": { "host": "127.0.0.1", "port": 4477 },
+  "dataDir": "./data"
+}

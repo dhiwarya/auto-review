@@ -1,0 +1,326 @@
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import type { LoadedConfig } from '../config.ts';
+import type { Db } from '../db.ts';
+import { checkoutPr, type Checkout } from '../git/checkout.ts';
+import type { GitHub } from '../github/client.ts';
+import { addLabel, removeLabel } from '../github/labels.ts';
+import { getPr } from '../github/prs.ts';
+import { postReview, type InlineComment } from '../github/publish.ts';
+import { NoProviderAvailable, type Router } from '../llm/router.ts';
+import type { Finding, Job, Provider } from '../types.ts';
+import { buildContext, type ReviewContext } from './context.ts';
+import { inlineBody, summaryBody } from './format.ts';
+import { mainInstructions, securityInstructions, verifyInstructions } from './prompts.ts';
+import { ReviewOut, reviewSchema, VerifyOut, verifySchema } from './schema.ts';
+import { lowerSeverity, minSeverity, placeFindings, type Candidate } from './validate.ts';
+
+// The job no longer needs doing: PR closed, or new commits replaced it.
+export class JobObsolete extends Error {}
+
+export class ReviewPipeline {
+  private readonly gh: GitHub;
+  private readonly cfg: LoadedConfig;
+  private readonly db: Db;
+  private readonly router: Router;
+
+  constructor(gh: GitHub, cfg: LoadedConfig, db: Db, router: Router) {
+    this.gh = gh;
+    this.cfg = cfg;
+    this.db = db;
+    this.router = router;
+  }
+
+  private step(job: Job, step: string, progress: number) {
+    this.db.updateJob(job.id, { step, progress });
+    this.db.event(job.id, step);
+  }
+
+  async run(job: Job, signal: AbortSignal): Promise<void> {
+    if (!this.cfg.isRepoAllowed(job.repo)) throw new JobObsolete('repo is not in repos.allow');
+    const pr = await getPr(this.gh, job.repo, job.pr_number);
+    if (pr.state !== 'open') throw new JobObsolete('PR is no longer open');
+    if (pr.headSha !== job.head_sha) throw new JobObsolete(`superseded by new commits (${pr.headSha.slice(0, 7)})`);
+    this.db.updateJob(job.id, { pr_title: pr.title, additions: pr.additions, deletions: pr.deletions, changed_files: pr.changedFiles });
+
+    // A retry after "pending review exists" only needs to post what was already prepared.
+    if (job.review_body && !job.review_id && !job.dry_run) {
+      await this.publish(job, this.db.findings(job.id));
+      return;
+    }
+
+    await this.labelStart(job);
+
+    const workDir = await fs.mkdtemp(path.join(os.tmpdir(), `auto-reviewer-work-${job.id}-`));
+    let checkout: Checkout | null = null;
+    try {
+      this.step(job, 'Checking out the PR', 10);
+      checkout = await checkoutPr(this.gh.token, job.repo, job.pr_number, job.head_sha, this.cfg.keepCheckouts);
+      if (signal.aborted) throw signal.reason;
+
+      this.step(job, 'Reading the PR, linked issues and guidelines', 18);
+      const previous = this.previousFindings(job);
+      const ctx = await buildContext(this.gh, this.cfg, pr, job.since_sha, previous);
+      this.db.event(
+        job.id,
+        `${ctx.incremental ? 'Follow-up review of new commits' : 'Full review'}: ${ctx.reviewFiles.length} files, ` +
+          `${ctx.changedLines} changed lines, ${ctx.issues.length} linked issue(s)${ctx.large ? ', large-PR mode' : ''}`,
+      );
+
+      const task = { cwd: checkout.dir, workDir, timeoutMs: this.cfg.limits.passTimeoutSec * 1000, signal };
+      this.step(job, 'Reviewing: code and requirements, security', 25);
+      let done = 0;
+      const progress = () => this.db.updateJob(job.id, { progress: 25 + ++done * 22 });
+      const [main, security] = await Promise.all([
+        this.router
+          .run(job.id, 'main', this.cfg.models.main, this.cfg.models.main.fallback, {
+            ...task,
+            instructions: mainInstructions(ctx.me, this.cfg.limits.maxNits),
+            prompt: ctx.prompt,
+            schema: reviewSchema,
+          })
+          .finally(progress),
+        this.router
+          .run(job.id, 'security', this.cfg.models.security, this.cfg.models.security.fallback, {
+            ...task,
+            instructions: securityInstructions(ctx.me),
+            prompt: ctx.prompt,
+            schema: reviewSchema,
+          })
+          .finally(progress),
+      ]);
+      const mainOut = parseReview(main.output, 'main');
+      const secOut = parseReview(security.output, 'security');
+      this.db.event(job.id, `Main pass (${main.provider}): ${mainOut.findings.length} finding(s). Security pass (${security.provider}): ${secOut.findings.length} finding(s).`);
+
+      let candidates: Candidate[] = [
+        ...mainOut.findings.map((f) => toCandidate(f, 'main', main.provider)),
+        ...secOut.findings.map((f) => toCandidate(f, 'security', security.provider)),
+      ];
+
+      const placeOpts = { checkoutDir: checkout.dir, prFiles: ctx.prFiles, previous, maxNits: this.cfg.limits.maxNits };
+      if (this.cfg.models.crossVerify && candidates.some((c) => c.severity === 'blocker' || c.severity === 'major')) {
+        this.step(job, 'Cross-checking blockers and majors with the other model', 72);
+        candidates = await this.verify(job, ctx, candidates, placeOpts, task);
+      }
+
+      this.step(job, 'Checking findings against the code', 88);
+      const placed = placeFindings(candidates, placeOpts);
+      const inserted = placed.map((p) =>
+        this.db.insertFinding({
+          job_id: job.id,
+          pass: p.pass,
+          model: p.model,
+          category: p.category,
+          severity: p.severity,
+          original_severity: p.original_severity,
+          confidence: p.confidence,
+          file: p.file,
+          line: p.line,
+          title: p.title,
+          evidence: p.evidence,
+          problem: p.problem,
+          suggestion: p.suggestion,
+          verification: p.verification,
+          verified_by: p.verified_by,
+          verify_reason: p.verify_reason,
+          status: p.status,
+          drop_reason: p.drop_reason,
+          comment_id: null,
+          outcome: null,
+        }),
+      );
+      const dropped = inserted.filter((f) => f.status === 'dropped');
+      if (dropped.length) this.db.event(job.id, `Discarded ${dropped.length} finding(s): ${[...new Set(dropped.map((f) => f.drop_reason?.split(':')[0]))].join('; ')}`);
+      if (placed.some((p) => p.drop_reason?.includes('exfiltration'))) {
+        this.db.event(job.id, 'A model tried to output a credential that is not in the PR. That finding was discarded; check the PR for prompt injection.', 'warn');
+      }
+
+      const resolvedIds = new Set([...mainOut.resolved_previous_ids, ...secOut.resolved_previous_ids]);
+      const resolved = previous.filter((f) => resolvedIds.has(f.id));
+      for (const f of resolved) this.db.updateFinding(f.id, { resolved_by_job: job.id });
+
+      const posted = inserted.filter((f) => f.status !== 'dropped');
+      const body = summaryBody({
+        headSha: job.head_sha,
+        sinceSha: ctx.incremental ? job.since_sha : null,
+        summaries: [mainOut.summary, secOut.summary],
+        specStatus: mainOut.spec_alignment.status,
+        specNotes: mainOut.spec_alignment.notes,
+        issues: ctx.issues,
+        findings: posted,
+        questions: [...mainOut.questions_for_author, ...secOut.questions_for_author].slice(0, 4),
+        resolved,
+        large: ctx.large,
+        excluded: ctx.excluded,
+        inlineFailed: false,
+        jobId: job.id,
+      });
+      job = this.db.updateJob(job.id, { review_body: body, spec_status: mainOut.spec_alignment.status });
+
+      if (signal.aborted) throw signal.reason;
+      await this.publish(job, inserted);
+    } finally {
+      await checkout?.cleanup();
+      await fs.rm(workDir, { recursive: true, force: true });
+    }
+  }
+
+  // Findings raised in earlier reviews of this PR that haven't been marked fixed.
+  private previousFindings(job: Job): Finding[] {
+    return this.db.all<Finding>(
+      `SELECT f.* FROM findings f JOIN jobs j ON j.id = f.job_id
+       WHERE j.repo = ? AND j.pr_number = ? AND j.id != ? AND j.state = 'done' AND j.dry_run = ?
+         AND f.status != 'dropped' AND f.resolved_by_job IS NULL AND COALESCE(f.outcome, '') != 'deleted'`,
+      job.repo, job.pr_number, job.id, job.dry_run,
+    );
+  }
+
+  private async verify(
+    job: Job,
+    ctx: ReviewContext,
+    candidates: Candidate[],
+    placeOpts: Parameters<typeof placeFindings>[1],
+    task: { cwd: string; workDir: string; timeoutMs: number; signal: AbortSignal },
+  ): Promise<Candidate[]> {
+    // Only findings that survive the cheap checks are worth a second model's time.
+    const pre = placeFindings(candidates, placeOpts);
+    const toVerify = candidates
+      .map((c, i) => ({ c, i }))
+      .filter(({ c, i }) => pre[i].status !== 'dropped' && (c.severity === 'blocker' || c.severity === 'major'));
+    if (!toVerify.length) return candidates;
+
+    const out = candidates.map((c) => ({ ...c }));
+    for (const producer of ['claude', 'codex'] as Provider[]) {
+      const batch = toVerify.filter(({ c }) => c.model === producer);
+      if (!batch.length) continue;
+      const verifier = this.cfg.otherProvider(producer);
+      const list = batch
+        .map(({ c, i }) =>
+          [`### Finding id ${i}`, `${c.severity} · ${c.category} · ${c.file}${c.line ? `:${c.line}` : ''}`, `Title: ${c.title}`, `Problem: ${c.problem}`, `Evidence:\n${c.evidence}`].join('\n'),
+        )
+        .join('\n\n');
+      try {
+        const res = await this.router.run(job.id, 'verify', { provider: verifier, model: null }, producer, {
+          ...task,
+          instructions: verifyInstructions(),
+          prompt: `${ctx.prompt}\n\n## Findings to check\n\n${list}`,
+          schema: verifySchema,
+        });
+        const parsed = VerifyOut.safeParse(res.output);
+        if (!parsed.success) throw new Error('verifier returned an unexpected shape');
+        const byId = new Map(parsed.data.verdicts.map((v) => [v.id, v]));
+        for (const { i } of batch) {
+          const v = byId.get(i);
+          const c = out[i];
+          c.verified_by = res.provider;
+          if (!v) {
+            c.verification = 'skipped';
+            continue;
+          }
+          c.verify_reason = v.reason;
+          c.verification = v.verdict;
+          if (v.verdict === 'confirmed') c.severity = minSeverity(c.severity, v.adjusted_severity);
+          if (v.verdict === 'uncertain') {
+            c.severity = lowerSeverity(c.severity);
+            c.confidence = 'low';
+          }
+        }
+        const refuted = batch.filter(({ i }) => out[i].verification === 'refuted').length;
+        this.db.event(job.id, `${res.provider} checked ${batch.length} ${producer} finding(s): ${refuted} refuted`);
+      } catch (err) {
+        if (task.signal.aborted) throw err;
+        for (const { i } of batch) out[i].verification = 'skipped';
+        const why = err instanceof NoProviderAvailable ? 'no model available' : err instanceof Error ? err.message : String(err);
+        this.db.event(job.id, `Couldn't cross-check ${producer}'s findings (${why}); posting them unverified`, 'warn');
+      }
+    }
+    return out;
+  }
+
+  private async publish(job: Job, findings: Finding[]) {
+    const posted = findings.filter((f) => f.status !== 'dropped');
+    const hasBlocker = posted.some((f) => f.severity === 'blocker');
+    const inline: InlineComment[] = posted
+      .filter((f) => f.status === 'inline' && f.line !== null)
+      .map((f) => ({ findingId: f.id, path: f.file, line: f.line!, body: inlineBody(f) }));
+
+    if (job.dry_run) {
+      this.step(job, `Dry run: would post a ${job.mode} review with ${inline.length} inline comment(s)`, 100);
+      this.db.setState(job.id, 'done', { review_state: 'DRY_RUN', progress: 100 });
+      return;
+    }
+
+    // Last check before speaking for you: don't post on a commit that's already outdated.
+    const pr = await getPr(this.gh, job.repo, job.pr_number);
+    if (pr.headSha !== job.head_sha) throw new JobObsolete(`superseded by new commits (${pr.headSha.slice(0, 7)})`);
+
+    this.step(job, job.mode === 'draft' ? 'Posting draft review (only you can see it)' : 'Posting review comment', 95);
+    const res = await postReview(this.gh, job.repo, job.pr_number, job.head_sha, job.mode, job.review_body ?? '', inline);
+    if (res.droppedInline) {
+      this.db.event(job.id, 'GitHub rejected an inline comment position, so every finding went into the review body instead', 'warn');
+      for (const f of inline) this.db.updateFinding(f.findingId, { status: 'summary' });
+    }
+    for (const [findingId, commentId] of res.commentIds) this.db.updateFinding(findingId, { comment_id: commentId });
+    for (const f of posted) this.db.updateFinding(f.id, { outcome: job.mode === 'draft' ? 'pending' : 'published' });
+
+    const labelOk = await this.labelFinish(job, hasBlocker);
+    this.db.setState(job.id, 'done', {
+      review_id: res.id,
+      review_url: res.url,
+      review_state: res.state,
+      label_ok: labelOk ? 1 : 0,
+      progress: 100,
+      step: job.mode === 'draft' ? 'Draft review ready for you on GitHub' : 'Review posted',
+    });
+    this.db.event(job.id, `Review ${res.state.toLowerCase()} with ${res.commentIds.size} inline comment(s): ${res.url}`);
+  }
+
+  private async labelStart(job: Job) {
+    if (job.dry_run) return;
+    const ok = await addLabel(this.gh, job.repo, job.pr_number, this.cfg.labelName('running'));
+    if (!ok) this.db.event(job.id, 'Can\'t set labels on this repo (needs triage access); the review body carries a marker instead', 'warn');
+    await removeLabel(this.gh, job.repo, job.pr_number, this.cfg.labelName('failed'));
+  }
+
+  private async labelFinish(job: Job, hasBlocker: boolean): Promise<boolean> {
+    const { repo, pr_number: n } = job;
+    await removeLabel(this.gh, repo, n, this.cfg.labelName('running'));
+    const ok = await addLabel(this.gh, repo, n, this.cfg.labelName('done'));
+    const showBlocker = hasBlocker && (job.mode === 'publish' || this.cfg.labels.blockerLabelInDraft);
+    if (showBlocker) await addLabel(this.gh, repo, n, this.cfg.labelName('blocker'));
+    else await removeLabel(this.gh, repo, n, this.cfg.labelName('blocker'));
+    return ok;
+  }
+
+  async labelFailed(job: Job) {
+    if (job.dry_run) return;
+    await removeLabel(this.gh, job.repo, job.pr_number, this.cfg.labelName('running'));
+    await addLabel(this.gh, job.repo, job.pr_number, this.cfg.labelName('failed'));
+  }
+
+  async labelCancelled(job: Job) {
+    if (job.dry_run) return;
+    await removeLabel(this.gh, job.repo, job.pr_number, this.cfg.labelName('running'));
+  }
+}
+
+function parseReview(output: unknown, pass: string): ReviewOut {
+  const parsed = ReviewOut.safeParse(output);
+  if (!parsed.success) throw new Error(`${pass} pass returned an unexpected shape: ${parsed.error.issues[0]?.message ?? ''}`);
+  return parsed.data;
+}
+
+function toCandidate(f: ReviewOut['findings'][number], pass: 'main' | 'security', model: Provider): Candidate {
+  return {
+    ...f,
+    category: pass === 'security' ? 'security' : f.category,
+    pass,
+    model,
+    original_severity: f.severity,
+    verification: 'not_needed',
+    verified_by: null,
+    verify_reason: null,
+  };
+}

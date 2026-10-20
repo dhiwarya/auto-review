@@ -1,0 +1,156 @@
+# Auto Reviewer
+
+A personal review agent that runs on your own machine. When someone requests your review on GitHub, it reviews the PR with your own Claude Code and Codex logins and leaves a **draft review that only you can see**. You edit it and submit it yourself. A local dashboard shows the queue, live progress and leaderboards.
+
+## What a review covers
+
+| Pass | Default model | Looks for |
+| --- | --- | --- |
+| Code + requirements | Claude (`opus`) | Bugs, edge cases, error handling, concurrency, weak tests, breaking changes. It also compares the code with the linked GitHub issues: requirements that are **missing**, implemented **differently** from the issue, or **inconsistent** with the PR description. |
+| Security | Codex | Injection, auth gaps, secrets, SSRF, path traversal, unsafe deserialization, risky dependency or CI changes, each traced from input to sink. |
+| Cross-check | the other model | Every blocker and major is re-checked by the model that didn't raise it. Refuted findings are dropped, and uncertain ones are downgraded. |
+
+After that, plain code (no model) checks each finding:
+- The quoted evidence must really exist in the file.
+- The file must exist.
+- The comment must sit on a line GitHub accepts. If it doesn't, the finding moves to the summary.
+- Duplicates and points already raised in an earlier review are removed.
+- Nits are capped.
+- Any credential in the output is redacted. If a credential appears that the PR itself didn't add, the finding is dropped as a possible exfiltration attempt.
+
+Severity scale: **blocker**, **major**, **minor**, **nit**.
+
+## Lifecycle
+
+```
+review requested ─► queued ─► reviewing ─► draft review posted ─► ai-review:done
+                                  │
+       new commits pushed ────────┤ (follow-up review of only the new commits; fixed findings are listed)
+       request removed/PR closed ─┤ cancelled
+       both models at their limit ┤ waiting until the limit resets
+       you have a pending review  ┤ waiting until you submit or discard it
+       3 failed attempts ─────────┴ ai-review:failed
+```
+
+| Label | Meaning |
+| --- | --- |
+| `ai-review:running` | Review in progress |
+| `ai-review:done` | Review finished. In draft mode, the draft is waiting for you. |
+| `ai-review:blocker` | At least one blocker. In draft mode this label is added only after you submit with a blocker kept. |
+| `ai-review:failed` | Gave up after retries |
+
+Adding labels needs triage access. If the token can't add them, the review still works, and the summary carries a hidden marker instead.
+
+## Safety model
+
+- **Only repos in `repos.allow`** are ever reviewed. Keep public repos where strangers open PRs out of it.
+- **Read-only agents.** Claude runs as `claude -p --restricted --tools Read,Grep,Glob`, with no MCP servers and no project settings or hooks loaded from the PR. Codex runs as `codex exec --sandbox read-only`, with no user config, no rules and no `AGENTS.md`. PR code is never built, installed or run.
+- **The agents never see your GitHub token.** They get an allowlisted environment, and their only output is JSON. The app does all GitHub writes itself.
+- **Throwaway checkouts.** Each review gets a shallow checkout of the PR head in a temp folder, with symlinks disabled. It's deleted afterwards.
+- **Never approves and never requests changes.** Draft mode posts a pending review. Publish mode posts a plain comment review.
+- **Local dashboard.** It listens on `127.0.0.1` only, rejects foreign `Host` headers (DNS rebinding), and requires a custom header on every write (CSRF).
+- **Subscription terms.** It drives the official `claude` and `codex` CLIs with your own logins, for your own review queue. Don't share one instance with teammates. Each person should run their own.
+- **Company code.** These reviews send your repos' code to your personal Claude and ChatGPT accounts. Check that your employer allows it, and turn off model training in both accounts.
+
+## Setup
+
+Requirements: Node 22.18 or newer, `git`, and the [GitHub CLI](https://cli.github.com) (or a token). You also need [Claude Code](https://code.claude.com) and/or the [Codex CLI](https://developers.openai.com/codex). One of the two is enough: the app falls back to whichever is available.
+
+```bash
+npm install
+npm run build
+```
+
+Sign in to each tool:
+
+```bash
+gh auth login
+```
+
+```bash
+claude auth login
+```
+
+```bash
+codex login
+```
+
+Create your config, then set `repos.allow`:
+
+```bash
+cp reviewer.config.example.json reviewer.config.json
+```
+
+A fine-grained GitHub token is optional but recommended. It limits the bot to the allowlisted repos (`.env.example` lists the scopes). Without one, the app uses your `gh` login.
+
+```bash
+cp .env.example .env
+```
+
+Start it:
+
+```bash
+npm start
+```
+
+Open http://127.0.0.1:4477.
+
+It starts in **dry run**: reviews run and appear in the dashboard, but nothing is posted. Once the findings look right, set `"dryRun": false` and restart.
+
+### Start at login
+
+| OS | Command |
+| --- | --- |
+| macOS | `sh deploy/macos/install.sh` (remove with `sh deploy/macos/install.sh remove`). Logs go to `data/reviewer.log`. |
+| Linux | Follow the steps at the top of `deploy/linux/auto-reviewer.service` (systemd user service) |
+| Windows | `powershell -ExecutionPolicy Bypass -File deploy\windows\install.ps1` (Task Scheduler) |
+
+## Dashboard
+
+- **Queue:** live progress of running reviews, queued and waiting work, history, and a box to review any allowlisted PR on demand.
+- **Job page:** every finding (including discarded ones and why), the timeline, model runs, and the review text. In dry run, the review text is what would have been posted.
+- **Leaderboard:**
+  - **Models:** keep rate per model and pass, refuted findings, findings with bad evidence, speed and failures.
+  - **Repos:** clean-PR rate, findings per PR, blockers, security findings, requirement gaps.
+  - **Authors:** the same metrics per author. They stay on your machine.
+
+The keep rate is learned automatically. After you submit a draft, the app checks which of its comments you kept, edited or deleted.
+
+## Configuration
+
+Settings live in `reviewer.config.json`. Restart after changes.
+
+| Key | Default | |
+| --- | --- | --- |
+| `repos.allow` / `repos.deny` | none | `owner/repo` globs |
+| `dryRun` | `true` | Review without posting |
+| `defaultMode`, `repoModes` | `draft` | `draft` or `publish`, globally or per repo |
+| `models.main`, `models.security` | Claude opus / Codex default | `{ provider, model, fallback }` |
+| `models.crossVerify` | `true` | Re-check blockers and majors with the other model |
+| `schedule.pollIntervalSec` | `5` | How often to check GitHub for review requests. Each check is one search request (GitHub allows 30 a minute), and a PR is only re-read when it changed. |
+| `schedule.syncIntervalSec` | `60` | How often to check which comments you kept in submitted drafts |
+| `schedule.maxReviewsPerHour` | `6` | Protects your subscription limits |
+| `schedule.pauseBetween` | `null` | e.g. `{ "start": "09:00", "end": "18:00" }` to keep daytime quota for yourself |
+| `schedule.quotaBackoffMin` | `30` | How long to rest a model after it reports a usage limit |
+| `limits.largePrLines` | `1500` | Above this, only blockers and majors are reported |
+| `limits.maxNits` | `5` | |
+| `excludeGlobs` | lockfiles, vendored, generated | Files left out of the review |
+| `skipAuthors` | dependabot, renovate, github-actions | |
+| `labels.prefix` | `ai-review` | |
+
+## Development
+
+| Command | Does |
+| --- | --- |
+| `npm run dev` | API with auto-reload on port 4477 |
+| `npm run dev:web` | Dashboard with hot reload on port 5173 (proxies to the API) |
+| `npm test` | Unit tests for diff parsing and finding validation |
+| `npm run typecheck` | Type-check the API and the dashboard |
+
+The server runs TypeScript directly through Node's type stripping, so it has no build step. Only the dashboard is built, with Vite. State lives in `data/reviewer.sqlite`, using Node's built-in SQLite.
+
+## Known limits
+
+- One pending review per person per PR is a GitHub rule. If you're mid-way through your own review, the bot waits for you to submit or discard it.
+- Requirement checks read GitHub issues only: issues the PR closes and issues mentioned in its description.
+- A PR's `CLAUDE.md` may still be read by Claude as project memory. The instructions treat all repository content as untrusted, and draft mode means you see everything before anyone else does.

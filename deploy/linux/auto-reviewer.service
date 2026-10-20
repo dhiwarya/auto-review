@@ -1,0 +1,21 @@
+# systemd user service for Auto Reviewer.
+#   1. Replace /path/to/auto-reviewer below with the project folder.
+#   2. cp deploy/linux/auto-reviewer.service ~/.config/systemd/user/
+#   3. systemctl --user daemon-reload && systemctl --user enable --now auto-reviewer
+#   4. Optional, to keep it running while you're logged out: loginctl enable-linger "$USER"
+# Logs: journalctl --user -u auto-reviewer -f
+
+[Unit]
+Description=Auto Reviewer
+After=network-online.target
+
+[Service]
+WorkingDirectory=/path/to/auto-reviewer
+ExecStart=/usr/bin/env node src/index.ts
+Restart=always
+RestartSec=30
+# systemd's PATH is minimal; include wherever node, git, gh, claude and codex are installed.
+Environment=PATH=%h/.local/bin:%h/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=default.target
