@@ -1,69 +1,132 @@
-import type { LoadedConfig } from '../config.ts';
+import type { SettingsStore } from '../settings.ts';
 import { nowIso, type Db } from '../db.ts';
-import { rateLimitResetAt, type GitHub } from '../github/client.ts';
-import { getPr, searchRequestedPrs, type PrInfo } from '../github/prs.ts';
+import { rateLimited, type GitHub } from '../github/client.ts';
+import { getPr, type PrInfo } from '../github/prs.ts';
+import { RepoWatcher, type OpenPr } from '../github/watch.ts';
 import { bus } from '../bus.ts';
 import { ACTIVE_STATES, type Job } from '../types.ts';
 import type { Worker } from './worker.ts';
 import type { OutcomeSync } from './sync.ts';
 
+// Polling stops when fewer than this many requests are left in the hourly budget, so
+// posting reviews and labels still works.
+const CORE_RESERVE = 300;
+const MAX_BACKOFF_MIN = 15;
+
+export interface PollerStatus {
+  pausedUntil: string | null;
+  pauseReason: string | null;
+}
+
 export class Poller {
   private readonly gh: GitHub;
-  private readonly cfg: LoadedConfig;
+  private readonly cfg: SettingsStore;
   private readonly db: Db;
   private readonly worker: Worker;
   private readonly sync: OutcomeSync;
+  readonly watcher: RepoWatcher;
   private timer: NodeJS.Timeout | null = null;
+  private stopped = false;
   private polling = false;
-  // PR -> updated_at from the last search. A PR is only re-read when GitHub says it
-  // changed, so frequent polling costs one search request per check.
-  private readonly seen = new Map<string, string>();
   private pausedUntil = 0;
+  private pauseReason: string | null = null;
+  private strikes = 0; // consecutive "slow down" answers without a retry time
   private lastSyncAt = 0;
 
-  constructor(gh: GitHub, cfg: LoadedConfig, db: Db, worker: Worker, sync: OutcomeSync) {
+  constructor(gh: GitHub, cfg: SettingsStore, db: Db, worker: Worker, sync: OutcomeSync, watcher?: RepoWatcher) {
     this.gh = gh;
     this.cfg = cfg;
     this.db = db;
     this.worker = worker;
     this.sync = sync;
+    this.watcher = watcher ?? new RepoWatcher(gh, cfg);
   }
 
   start() {
-    const every = this.cfg.schedule.pollIntervalSec * 1000;
-    this.timer = setInterval(() => void this.pollOnce(), every);
-    void this.pollOnce();
+    bus.on('settings', this.onSettings);
+    this.scheduleNext(0);
   }
 
   stop() {
-    if (this.timer) clearInterval(this.timer);
+    this.stopped = true;
+    if (this.timer) clearTimeout(this.timer);
+    bus.off('settings', this.onSettings);
+  }
+
+  status(): PollerStatus {
+    const paused = this.pausedUntil > Date.now();
+    return { pausedUntil: paused ? new Date(this.pausedUntil).toISOString() : null, pauseReason: paused ? this.pauseReason : null };
+  }
+
+  // Saving settings checks again right away, for example to pick up repos you just added.
+  private readonly onSettings = () => this.scheduleNext(500);
+
+  // Re-reads the interval after every check, so a change in Settings applies to the next one.
+  private scheduleNext(ms: number) {
+    if (this.stopped) return;
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = setTimeout(async () => {
+      await this.pollOnce();
+      this.scheduleNext(this.cfg.schedule.pollIntervalSec * 1000);
+    }, ms);
+  }
+
+  private pause(until: number, reason: string) {
+    this.pausedUntil = until;
+    this.pauseReason = reason;
+    this.db.setKv('last_poll_error', `${reason}; checking again at ${new Date(until).toLocaleTimeString()}`);
+    console.error(`[poll] ${reason}; pausing until ${new Date(until).toLocaleTimeString()}`);
   }
 
   async pollOnce(): Promise<void> {
     if (this.polling || Date.now() < this.pausedUntil) return;
     this.polling = true;
+    this.watcher.startCycle();
     try {
-      const requested = await searchRequestedPrs(this.gh);
-      const requestedKeys = new Set(requested.map((r) => `${r.repo}#${r.number}`));
-      for (const key of this.seen.keys()) if (!requestedKeys.has(key)) this.seen.delete(key);
+      // Nothing to do until you add repos in Settings, so don't spend GitHub requests.
+      if (this.cfg.needsSetup) {
+        this.db.setKv('last_poll_error', null);
+        return;
+      }
+      const core = this.gh.rateLimits.get('core');
+      if (core && core.remaining < CORE_RESERVE) {
+        this.pause(new Date(core.reset).getTime(), `Only ${core.remaining} GitHub requests left this hour, kept for posting reviews`);
+        return;
+      }
 
-      for (const r of requested) {
-        if (!this.cfg.isRepoAllowed(r.repo)) continue; // never touch repos outside the allowlist
-        const key = `${r.repo}#${r.number}`;
-        if (this.seen.get(key) === r.updatedAt) continue;
+      const me = this.gh.me.toLowerCase();
+      const requestedKeys = new Set<string>();
+      const polled = new Set<string>();
+      for (const repo of await this.watcher.watchedRepos()) {
+        let prs: OpenPr[];
         try {
-          const pr = await getPr(this.gh, r.repo, r.number);
-          if (pr.state === 'open' && !pr.draft) this.enqueue(pr, 'request');
-          this.seen.set(key, r.updatedAt);
+          prs = await this.watcher.openPrs(repo);
         } catch (err) {
-          if (rateLimitResetAt(err)) throw err;
-          console.error(`[poll] ${key}: ${err instanceof Error ? err.message : err}`);
+          if (rateLimited(err)) throw err;
+          console.error(`[poll] ${repo}: ${err instanceof Error ? err.message : err}`);
+          continue;
+        }
+        polled.add(repo.toLowerCase());
+        for (const pr of prs) {
+          if (pr.draft || !pr.requestedReviewers.some((u) => u.toLowerCase() === me)) continue;
+          requestedKeys.add(`${pr.repo}#${pr.number}`.toLowerCase());
+          if (!this.needsJob(pr)) continue;
+          try {
+            const info = await getPr(this.gh, pr.repo, pr.number);
+            if (info.state === 'open' && !info.draft) this.enqueue(info, 'request');
+          } catch (err) {
+            if (rateLimited(err)) throw err;
+            console.error(`[poll] ${pr.repo}#${pr.number}: ${err instanceof Error ? err.message : err}`);
+          }
         }
       }
 
       // Review requests that went away (removed, PR closed or merged) cancel pending work.
+      // Only for repos checked successfully just now: a failed check says nothing.
       for (const job of this.db.all<Job>(`SELECT * FROM jobs WHERE source = 'request' AND state IN ('queued', 'running', 'waiting')`)) {
-        if (!requestedKeys.has(`${job.repo}#${job.pr_number}`)) {
+        if (!this.cfg.isRepoAllowed(job.repo)) {
+          this.worker.cancel(job.id, 'repo removed from your list', 'obsolete');
+        } else if (polled.has(job.repo.toLowerCase()) && !requestedKeys.has(`${job.repo}#${job.pr_number}`.toLowerCase())) {
           this.worker.cancel(job.id, 'review request removed or PR closed', 'request-removed');
         }
       }
@@ -73,23 +136,36 @@ export class Poller {
         this.lastSyncAt = Date.now();
         await this.sync.syncOnce();
       }
+      this.strikes = 0;
+      this.pauseReason = null;
       this.db.setKv('last_poll_error', null);
     } catch (err) {
-      const resetAt = rateLimitResetAt(err);
-      if (resetAt) {
-        this.pausedUntil = resetAt.getTime();
-        this.db.setKv('last_poll_error', `GitHub rate limit reached; checking again at ${resetAt.toLocaleTimeString()}`);
+      const limited = rateLimited(err);
+      if (limited?.kind === 'primary') {
+        this.pause(limited.resetAt!.getTime(), 'GitHub rate limit reached');
+      } else if (limited) {
+        // GitHub asks for exponential back-off when it doesn't say how long to wait.
+        const backoff = Math.min(MAX_BACKOFF_MIN, 2 ** this.strikes) * 60_000;
+        this.strikes++;
+        this.pause(Math.max(limited.resetAt?.getTime() ?? 0, Date.now() + backoff), 'GitHub asked the app to slow down');
       } else {
         this.db.setKv('last_poll_error', err instanceof Error ? err.message : String(err));
+        console.error('[poll] failed:', err instanceof Error ? err.message : err);
       }
-      console.error('[poll] failed:', err instanceof Error ? err.message : err);
     } finally {
       const next = Math.max(Date.now() + this.cfg.schedule.pollIntervalSec * 1000, this.pausedUntil);
       this.db.setKv('last_poll_at', nowIso());
       this.db.setKv('next_poll_at', new Date(next).toISOString());
+      this.db.setKv('last_poll_stats', JSON.stringify(this.watcher.stats));
       this.polling = false;
       bus.overviewChanged();
     }
+  }
+
+  // Decided from the database alone, so an unchanged PR costs no extra GitHub request.
+  private needsJob(pr: OpenPr): boolean {
+    const same = this.db.jobsForPr(pr.repo, pr.number).find((j) => j.head_sha === pr.headSha);
+    return !same || (same.state === 'cancelled' && same.skip_reason === 'request-removed');
   }
 
   // Creates the job for this PR's current head commit, if there isn't one yet.

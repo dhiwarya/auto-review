@@ -1,4 +1,4 @@
-import type { LoadedConfig } from '../config.ts';
+import type { SettingsStore } from '../settings.ts';
 import type { Db } from '../db.ts';
 import type { GitHub } from '../github/client.ts';
 import { addLabel } from '../github/labels.ts';
@@ -12,10 +12,10 @@ const stripMarker = (body: string) => body.replace(FINDING_MARKER, '').trim();
 // before submitting. This is what the leaderboards' keep rate is built on.
 export class OutcomeSync {
   private readonly gh: GitHub;
-  private readonly cfg: LoadedConfig;
+  private readonly cfg: SettingsStore;
   private readonly db: Db;
 
-  constructor(gh: GitHub, cfg: LoadedConfig, db: Db) {
+  constructor(gh: GitHub, cfg: SettingsStore, db: Db) {
     this.gh = gh;
     this.cfg = cfg;
     this.db = db;

@@ -111,6 +111,12 @@ export interface Run {
   fell_back: number;
   duration_ms: number;
   error: string | null;
+  turns: number | null;
+  tool_calls: number | null;
+  input_tokens: number | null;
+  cached_input_tokens: number | null;
+  output_tokens: number | null;
+  cost_usd: number | null;
   created_at: string;
 }
 
@@ -136,10 +142,21 @@ export interface ReviewerSettings {
   doubleCheck: boolean;
 }
 
+export interface GitHubStatus {
+  limits: { resource: string; limit: number; remaining: number; reset: string }[];
+  watching: { repo: string; ok: boolean; error: string | null; openPrs: number; requestingYou: number; checkedAt: string | null }[];
+  paused_until: string | null;
+  pause_reason: string | null;
+  // The last check: requests sent, and how many came back "not modified" (free).
+  last_cycle: { requests: number; notModified: number } | null;
+}
+
 export interface Overview {
   me: string | null;
   github_auth: string;
   settings: ReviewerSettings;
+  // No repos configured yet: nothing is reviewed until you add some in Settings.
+  needs_setup: boolean;
   dry_run: boolean;
   default_mode: ReviewMode;
   counts: Record<JobState, number>;
@@ -148,6 +165,7 @@ export interface Overview {
   last_poll_error: string | null;
   providers: ProviderStatus[];
   paused_reason: string | null;
+  github: GitHubStatus;
 }
 
 export interface JobDetail {
@@ -166,7 +184,7 @@ export interface LeaderboardRow {
 
 export interface Leaderboard {
   kind: LeaderboardKind;
-  columns: { key: string; label: string; hint?: string; format?: 'pct' | 'num' | 'ms' }[];
+  columns: { key: string; label: string; hint?: string; format?: 'pct' | 'num' | 'ms' | 'tokens' }[];
   rows: LeaderboardRow[];
 }
 

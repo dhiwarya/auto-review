@@ -1,6 +1,6 @@
-import type { LoadedConfig } from '../config.ts';
+import type { SettingsStore } from '../settings.ts';
 import { nowIso, type Db } from '../db.ts';
-import { HeadMovedError } from '../git/checkout.ts';
+import { HeadMovedError } from '../git/mirror.ts';
 import { PendingReviewExists } from '../github/publish.ts';
 import { NoProviderAvailable } from '../llm/router.ts';
 import { JobObsolete, type ReviewPipeline } from '../review/pipeline.ts';
@@ -21,13 +21,13 @@ function inPauseWindow(window: { start: string; end: string } | null, now = new 
 
 export class Worker {
   private readonly db: Db;
-  private readonly cfg: LoadedConfig;
+  private readonly cfg: SettingsStore;
   private readonly pipeline: ReviewPipeline;
   private readonly running = new Map<number, AbortController>();
   private timer: NodeJS.Timeout | null = null;
   private stopping = false;
 
-  constructor(db: Db, cfg: LoadedConfig, pipeline: ReviewPipeline) {
+  constructor(db: Db, cfg: SettingsStore, pipeline: ReviewPipeline) {
     this.db = db;
     this.cfg = cfg;
     this.pipeline = pipeline;

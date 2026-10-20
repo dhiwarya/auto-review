@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import type { Leaderboard, LeaderboardKind } from '../../../src/types.ts';
 import { getJson, useStream } from '../api.ts';
-import { duration } from '../ui.tsx';
+import { compact, duration } from '../ui.tsx';
 
 const TABS: { kind: LeaderboardKind; label: string; blurb: string; keyLabel: string; defaultSort: string }[] = [
   {
@@ -27,11 +27,12 @@ const TABS: { kind: LeaderboardKind; label: string; blurb: string; keyLabel: str
   },
 ];
 
-function fmt(value: string | number | null, format?: 'pct' | 'num' | 'ms') {
+function fmt(value: string | number | null, format?: 'pct' | 'num' | 'ms' | 'tokens') {
   if (value === null || value === undefined) return '—';
   if (typeof value === 'string') return value;
   if (format === 'pct') return `${Math.round(value * 100)}%`;
   if (format === 'ms') return duration(value);
+  if (format === 'tokens') return compact(value);
   return Number.isInteger(value) ? String(value) : value.toFixed(1);
 }
 

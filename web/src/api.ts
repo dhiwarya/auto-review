@@ -7,16 +7,27 @@ export async function getJson<T>(path: string): Promise<T> {
   return res.json() as Promise<T>;
 }
 
-export async function postJson<T = unknown>(path: string, body: unknown = {}): Promise<T> {
+// Errors carry the server's response body, e.g. per-field issues from a settings save.
+export class ApiError extends Error {
+  readonly data: unknown;
+  constructor(message: string, data: unknown) {
+    super(message);
+    this.data = data;
+  }
+}
+
+export async function sendJson<T = unknown>(method: 'POST' | 'PUT', path: string, body: unknown = {}): Promise<T> {
   const res = await fetch(path, {
-    method: 'POST',
+    method,
     headers: { 'content-type': 'application/json', 'x-auto-reviewer': '1' },
     body: JSON.stringify(body),
   });
   const data = await res.json().catch(() => null);
-  if (!res.ok) throw new Error(data?.error ?? res.statusText);
+  if (!res.ok) throw new ApiError(data?.error ?? res.statusText, data);
   return data as T;
 }
+
+export const postJson = <T = unknown>(path: string, body: unknown = {}) => sendJson<T>('POST', path, body);
 
 type Listener = (msg: StreamMessage) => void;
 const listeners = new Set<Listener>();

@@ -67,3 +67,11 @@ export function Progress({ value }: { value: number }) {
 }
 
 export const shortSha = (sha: string | null | undefined) => (sha ? sha.slice(0, 7) : '');
+
+// 41234 -> "41.2k"
+export function compact(n: number | null | undefined): string {
+  if (n === null || n === undefined || Number.isNaN(n)) return '—';
+  if (n < 1000) return String(Math.round(n));
+  if (n < 1_000_000) return `${(n / 1000).toFixed(n < 10_000 ? 1 : 0)}k`;
+  return `${(n / 1_000_000).toFixed(1)}M`;
+}

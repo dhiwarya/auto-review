@@ -45,10 +45,10 @@ Adding labels needs triage access. If the token can't add them, the review still
 
 ## Safety model
 
-- **Only repos in `repos.allow`** are ever reviewed. Keep public repos where strangers open PRs out of it.
+- **Only the repos you list in Settings** are ever reviewed. Keep public repos where strangers open PRs out of that list.
 - **Read-only agents.** Claude runs as `claude -p --restricted --tools Read,Grep,Glob`, with no MCP servers and no project settings or hooks loaded from the PR, so it can only read files. Codex runs as `codex exec --sandbox read-only`, with no user config, no rules and no `AGENTS.md`. Codex works through shell commands, so its instructions forbid running, building, installing or testing anything from the repository. Its sandbox also blocks file writes and network access, and any credential that shows up in its output is dropped.
 - **The agents never see your GitHub token.** They get an allowlisted environment, and their only output is JSON. The app does all GitHub writes itself.
-- **Throwaway checkouts.** Each review gets a shallow checkout of the PR head in a temp folder, with symlinks disabled. It's deleted afterwards.
+- **Throwaway checkouts.** Each review gets its own worktree of the PR head in a temp folder, made from the local repo copy, with symlinks disabled. It's deleted afterwards. Your GitHub token is passed to git through the environment and never written into the local copy.
 - **Never approves and never requests changes.** Draft mode posts a pending review. Publish mode posts a plain comment review.
 - **Local dashboard.** It listens on `127.0.0.1` only, rejects foreign `Host` headers (DNS rebinding), and requires a custom header on every write (CSRF).
 - **Subscription terms.** It drives the official `claude` and `codex` CLIs with your own logins, for your own review queue. Don't share one instance with teammates. Each person should run their own.
@@ -77,13 +77,7 @@ claude auth login
 codex login
 ```
 
-Create your config, then set `repos.allow`:
-
-```bash
-cp reviewer.config.example.json reviewer.config.json
-```
-
-A fine-grained GitHub token is optional but recommended. It limits the bot to the allowlisted repos (`.env.example` lists the scopes). Without one, the app uses your `gh` login.
+A fine-grained GitHub token is optional but recommended. It limits the bot to the repos it reviews (`.env.example` lists the scopes). Without one, the app uses your `gh` login.
 
 ```bash
 cp .env.example .env
@@ -95,9 +89,9 @@ Start it:
 npm start
 ```
 
-Open http://127.0.0.1:4477.
+Open http://127.0.0.1:4477, go to **Settings**, and list the repos to review. Nothing is reviewed until you do.
 
-It starts in **dry run**: reviews run and appear in the dashboard, but nothing is posted. Once the findings look right, set `"dryRun": false` and restart.
+It starts in **dry run**: reviews run and appear in the dashboard, but nothing is posted. Once the findings look right, turn dry run off in Settings.
 
 ### Start at login
 
@@ -110,37 +104,62 @@ It starts in **dry run**: reviews run and appear in the dashboard, but nothing i
 ## Dashboard
 
 - **Queue:** live progress of running reviews, queued and waiting work, history, and a box to review any allowlisted PR on demand.
-- **Job page:** every finding (including discarded ones and why), the timeline, model runs, and the review text. In dry run, the review text is what would have been posted.
+- **Job page:** every finding (including discarded ones and why), the timeline, model runs with their tool calls and tokens, and the review text. In dry run, the review text is what would have been posted.
 - **Leaderboard:**
-  - **Models:** keep rate per model and pass, refuted findings, findings with bad evidence, speed and failures.
+  - **Models:** keep rate per model and pass, refuted findings, findings with bad evidence, speed, failures, and average tool calls and tokens per run.
   - **Repos:** clean-PR rate, findings per PR, blockers, security findings, requirement gaps.
   - **Authors:** the same metrics per author. They stay on your machine.
 
 The keep rate is learned automatically. After you submit a draft, the app checks which of its comments you kept, edited or deleted.
 
-## Configuration
+## Settings
 
-Settings live in `reviewer.config.json`. Restart after changes.
+Everything is set on the dashboard's **Settings** page and stored in the app's database (`data/reviewer.sqlite`). A save is checked as a whole and applies straight away, with no restart. Defaults:
 
-| Key | Default | |
+| Section | Setting | Default |
 | --- | --- | --- |
-| `repos.allow` / `repos.deny` | none | `owner/repo` globs |
-| `dryRun` | `true` | Review without posting |
-| `defaultMode`, `repoModes` | `draft` | `draft` or `publish`, globally or per repo |
-| `models.provider` | `codex` | Who does the whole review: `codex` or `claude`. Also on the Settings page. |
-| `models.fallbackToOther` | `true` | Use the other provider when every model of the chosen one is unavailable. Also on the Settings page. |
-| `models.doubleCheck` | `true` | Re-check blockers and majors in a second run before posting. Also on the Settings page. |
-| `models.codex`, `models.claude` | `gpt-6.1-sol` → `gpt-6-sol`; `claude-opus-5-5` → `claude-opus-4-8` | `{ model, fallbackModels }`: each provider's models, tried in order |
-| `schedule.pollIntervalSec` | `5` | How often to check GitHub for review requests. Each check is one search request (GitHub allows 30 a minute), and a PR is only re-read when it changed. |
-| `schedule.syncIntervalSec` | `60` | How often to check which comments you kept in submitted drafts |
-| `schedule.maxReviewsPerHour` | `6` | Protects your subscription limits |
-| `schedule.pauseBetween` | `null` | e.g. `{ "start": "09:00", "end": "18:00" }` to keep daytime quota for yourself |
-| `schedule.quotaBackoffMin` | `30` | How long to rest a model after it reports a usage limit |
-| `limits.largePrLines` | `1500` | Above this, only blockers and majors are reported |
-| `limits.maxNits` | `5` | |
-| `excludeGlobs` | lockfiles, vendored, generated | Files left out of the review |
-| `skipAuthors` | dependabot, renovate, github-actions | |
-| `labels.prefix` | `ai-review` | |
+| Repositories | Review pull requests in / Never review | None. Add `owner/repo` or `owner/*` |
+| Posting to GitHub | Dry run | On |
+| | How reviews are posted | Draft, with optional exceptions per repo |
+| Reviewer | Who reviews | Codex |
+| | If Codex runs out, use Claude instead | On |
+| | Double-check blockers and majors | On |
+| | Codex models | `gpt-6.1-sol`, then `gpt-6-sol` |
+| | Claude models | `claude-opus-5-5`, then `claude-opus-4-8` |
+| Schedule | Check GitHub every | 5 seconds (one request per watched repo, free when nothing changed) |
+| | Most reviews per hour | 6 |
+| | Pause during part of the day | Off |
+| | Rest a model after a usage limit | 30 minutes |
+| Review limits | Large PR above | 1,500 changed lines (then only blockers and majors) |
+| | Most nits per review | 5 |
+| Files and authors | Leave out of reviews | Lockfiles, vendored and generated files |
+| | Skip PRs by | dependabot, renovate, github-actions |
+| Labels | Label prefix | `ai-review` |
+
+Two things are set in `.env` instead, because the app needs them before the dashboard exists: `PORT` (default 4477) and `DATA_DIR` (default `./data`).
+
+Upgrading from a version that used `reviewer.config.json`: the app imports that file the first time it starts, then renames it to `reviewer.config.imported.json`.
+
+## How it watches GitHub
+
+The app checks each watched repo's list of open pull requests and looks for ones that request you. Each check is a *conditional* request: it sends back the version it saw last time, and when nothing changed GitHub answers "304 Not Modified", which doesn't count against your rate limit. With nothing new happening, checking every 5 seconds costs nothing.
+
+- Exact entries (`owner/repo`) are watched directly. Patterns (`owner/*`) are matched against the repos your login can access, a list refreshed every 10 minutes.
+- Requests are sent one at a time, at least a second apart, so a long repo list stretches the cycle instead of bursting.
+- If GitHub says the rate limit is reached, polling waits for the reset. If it asks the app to slow down without saying for how long, polling backs off for 1, 2, 4, 8 and then 15 minutes.
+- Polling also stops while fewer than 300 requests are left in the hour, so posting reviews keeps working.
+- Settings → GitHub usage shows each limit, what the last check cost, and the status of every watched repo.
+
+Each copy of the app shares your account's limits with everything else on your login, so run one copy per login.
+
+## Local repo copies
+
+The first review of a repo downloads a full copy into `data/repos/`. Later reviews fetch only new commits, and each gets a throwaway worktree. From the local copy the app reads:
+- diffs for follow-up reviews, and for big files whose diff GitHub leaves out
+- the repo's guideline files from the base commit
+- the recent history of each changed file, which goes into the prompt
+
+That saves GitHub requests and gives the reviewer history to work with. The copies use as much disk as a normal clone. Deleting `data/repos/` is safe: it's downloaded again on the next review.
 
 ## Development
 

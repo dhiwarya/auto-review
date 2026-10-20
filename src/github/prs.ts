@@ -1,11 +1,5 @@
 import { httpStatus, splitRepo, type GitHub } from './client.ts';
 
-export interface RequestedPr {
-  repo: string; // owner/name
-  number: number;
-  updatedAt: string; // changes on new commits, edits, labels and comments
-}
-
 export interface PrInfo {
   repo: string;
   number: number;
@@ -43,20 +37,10 @@ export interface LinkedIssue {
   comments: { author: string; body: string }[];
 }
 
-// PRs where you personally (not one of your teams) are a requested reviewer.
-export async function searchRequestedPrs(gh: GitHub): Promise<RequestedPr[]> {
-  const q = 'is:pr is:open user-review-requested:@me -is:draft archived:false';
-  const items = await gh.octokit.paginate('GET /search/issues', { q, per_page: 100 });
-  return items.map((it) => {
-    const repo = it.repository_url.replace('https://api.github.com/repos/', '');
-    return { repo, number: it.number, updatedAt: it.updated_at };
-  });
-}
-
 export async function getPr(gh: GitHub, repo: string, number: number): Promise<PrInfo> {
   const { data } = await gh.octokit.rest.pulls.get({ ...splitRepo(repo), pull_number: number });
   return {
-    repo,
+    repo: data.base.repo.full_name,
     number,
     title: data.title,
     body: data.body ?? '',
@@ -172,20 +156,4 @@ export async function getLinkedIssues(gh: GitHub, pr: PrInfo, limit = 5): Promis
     }
   }
   return issues;
-}
-
-// Contributor guidelines, read from the base commit so the PR can't rewrite them.
-export async function getGuidelines(gh: GitHub, repo: string, baseSha: string): Promise<{ path: string; text: string }[]> {
-  const out: { path: string; text: string }[] = [];
-  for (const p of ['CLAUDE.md', 'AGENTS.md', 'CONTRIBUTING.md', '.github/CONTRIBUTING.md']) {
-    try {
-      const { data } = await gh.octokit.rest.repos.getContent({ ...splitRepo(repo), path: p, ref: baseSha });
-      if (!Array.isArray(data) && data.type === 'file' && 'content' in data) {
-        out.push({ path: p, text: Buffer.from(data.content, 'base64').toString('utf8') });
-      }
-    } catch {
-      // Not present.
-    }
-  }
-  return out;
 }

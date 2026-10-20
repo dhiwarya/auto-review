@@ -80,6 +80,12 @@ CREATE TABLE IF NOT EXISTS runs (
   fell_back INTEGER NOT NULL DEFAULT 0,
   duration_ms INTEGER NOT NULL,
   error TEXT,
+  turns INTEGER,
+  tool_calls INTEGER,
+  input_tokens INTEGER,
+  cached_input_tokens INTEGER,
+  output_tokens INTEGER,
+  cost_usd REAL,
   created_at TEXT NOT NULL
 );
 
@@ -112,7 +118,15 @@ export class Db {
 
   // Columns added after the first release, for databases created before them.
   private migrate() {
-    const added: [table: string, column: string, type: string][] = [['findings', 'model_id', 'TEXT']];
+    const added: [table: string, column: string, type: string][] = [
+      ['findings', 'model_id', 'TEXT'],
+      ['runs', 'turns', 'INTEGER'],
+      ['runs', 'tool_calls', 'INTEGER'],
+      ['runs', 'input_tokens', 'INTEGER'],
+      ['runs', 'cached_input_tokens', 'INTEGER'],
+      ['runs', 'output_tokens', 'INTEGER'],
+      ['runs', 'cost_usd', 'REAL'],
+    ];
     for (const [table, column, type] of added) {
       const cols = this.all<{ name: string }>(`PRAGMA table_info(${table})`).map((c) => c.name);
       if (!cols.includes(column)) this.sql.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
@@ -209,9 +223,11 @@ export class Db {
 
   insertRun(r: Omit<Run, 'id' | 'created_at'>) {
     this.run(
-      `INSERT INTO runs (job_id, purpose, provider, model, ok, fell_back, duration_ms, error, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      r.job_id, r.purpose, r.provider, r.model, r.ok, r.fell_back, r.duration_ms, r.error, nowIso(),
+      `INSERT INTO runs (job_id, purpose, provider, model, ok, fell_back, duration_ms, error,
+         turns, tool_calls, input_tokens, cached_input_tokens, output_tokens, cost_usd, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      r.job_id, r.purpose, r.provider, r.model, r.ok, r.fell_back, r.duration_ms, r.error,
+      r.turns, r.tool_calls, r.input_tokens, r.cached_input_tokens, r.output_tokens, r.cost_usd, nowIso(),
     );
   }
 

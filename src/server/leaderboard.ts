@@ -18,20 +18,27 @@ function models(db: Db): Leaderboard {
       SUM(outcome IN ('kept', 'edited')) AS kept,
       SUM(outcome = 'deleted') AS deleted
     FROM findings GROUP BY COALESCE(model_id, model), pass`);
-  const runs = db.all<{ provider: string; purpose: string; runs: number; avg_ms: number; failed: number; fallbacks: number }>(`
+  const runs = db.all<{ provider: string; purpose: string; runs: number; avg_ms: number; failed: number; fallbacks: number; avg_tools: number | null; avg_in: number | null; avg_out: number | null }>(`
     SELECT COALESCE(model, provider) AS provider, purpose, COUNT(*) AS runs, AVG(CASE WHEN ok = 1 THEN duration_ms END) AS avg_ms,
-      SUM(ok = 0) AS failed, SUM(fell_back) AS fallbacks
+      SUM(ok = 0) AS failed, SUM(fell_back) AS fallbacks,
+      AVG(CASE WHEN ok = 1 THEN tool_calls END) AS avg_tools,
+      AVG(CASE WHEN ok = 1 THEN input_tokens END) AS avg_in,
+      AVG(CASE WHEN ok = 1 THEN output_tokens END) AS avg_out
     FROM runs GROUP BY COALESCE(model, provider), purpose`);
 
   const rows = new Map<string, LeaderboardRow>();
   const row = (provider: string, pass: string) => {
     const key = `${provider} · ${pass}`;
     if (!rows.has(key)) {
-      rows.set(key, { key, runs: 0, avg_ms: null, failed: 0, fallbacks: 0, raised: 0, posted: 0, refuted: 0, bad_evidence: 0, blockers: 0, kept: 0, deleted: 0, keep_rate: null });
+      rows.set(key, { key, runs: 0, avg_ms: null, avg_tools: null, avg_in: null, avg_out: null, failed: 0, fallbacks: 0, raised: 0, posted: 0, refuted: 0, bad_evidence: 0, blockers: 0, kept: 0, deleted: 0, keep_rate: null });
     }
     return rows.get(key)!;
   };
-  for (const r of runs) Object.assign(row(r.provider, r.purpose), { runs: r.runs, avg_ms: r.avg_ms, failed: r.failed, fallbacks: r.fallbacks });
+  for (const r of runs) {
+    Object.assign(row(r.provider, r.purpose), {
+      runs: r.runs, avg_ms: r.avg_ms, failed: r.failed, fallbacks: r.fallbacks, avg_tools: r.avg_tools, avg_in: r.avg_in, avg_out: r.avg_out,
+    });
+  }
   for (const f of findings) {
     Object.assign(row(f.model, f.pass), {
       raised: f.raised, posted: f.posted, refuted: f.refuted, bad_evidence: f.bad_evidence,
@@ -44,6 +51,9 @@ function models(db: Db): Leaderboard {
     columns: [
       { key: 'runs', label: 'Runs', format: 'num' },
       { key: 'avg_ms', label: 'Avg time', format: 'ms' },
+      { key: 'avg_tools', label: 'Tool calls / run', hint: 'File reads and searches (Claude) or shell commands (Codex)', format: 'num' },
+      { key: 'avg_in', label: 'Tokens in / run', hint: 'Including cached input', format: 'tokens' },
+      { key: 'avg_out', label: 'Tokens out / run', format: 'tokens' },
       { key: 'failed', label: 'Failed', format: 'num' },
       { key: 'fallbacks', label: 'Stood in', hint: 'Runs where this model covered for the first-choice model', format: 'num' },
       { key: 'raised', label: 'Raised', format: 'num' },

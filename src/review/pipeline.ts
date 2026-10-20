@@ -1,9 +1,9 @@
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import type { LoadedConfig } from '../config.ts';
+import type { SettingsStore } from '../settings.ts';
 import type { Db } from '../db.ts';
-import { checkoutPr, type Checkout } from '../git/checkout.ts';
+import type { Checkout, RepoCache } from '../git/mirror.ts';
 import type { GitHub } from '../github/client.ts';
 import { addLabel, removeLabel } from '../github/labels.ts';
 import { getPr } from '../github/prs.ts';
@@ -21,15 +21,17 @@ export class JobObsolete extends Error {}
 
 export class ReviewPipeline {
   private readonly gh: GitHub;
-  private readonly cfg: LoadedConfig;
+  private readonly cfg: SettingsStore;
   private readonly db: Db;
   private readonly router: Router;
+  private readonly cache: RepoCache;
 
-  constructor(gh: GitHub, cfg: LoadedConfig, db: Db, router: Router) {
+  constructor(gh: GitHub, cfg: SettingsStore, db: Db, router: Router, cache: RepoCache) {
     this.gh = gh;
     this.cfg = cfg;
     this.db = db;
     this.router = router;
+    this.cache = cache;
   }
 
   private step(job: Job, step: string, progress: number) {
@@ -38,7 +40,7 @@ export class ReviewPipeline {
   }
 
   async run(job: Job, signal: AbortSignal): Promise<void> {
-    if (!this.cfg.isRepoAllowed(job.repo)) throw new JobObsolete('repo is not in repos.allow');
+    if (!this.cfg.isRepoAllowed(job.repo)) throw new JobObsolete('repo is no longer in your repos list');
     const pr = await getPr(this.gh, job.repo, job.pr_number);
     if (pr.state !== 'open') throw new JobObsolete('PR is no longer open');
     if (pr.headSha !== job.head_sha) throw new JobObsolete(`superseded by new commits (${pr.headSha.slice(0, 7)})`);
@@ -55,13 +57,17 @@ export class ReviewPipeline {
     const workDir = await fs.mkdtemp(path.join(os.tmpdir(), `auto-reviewer-work-${job.id}-`));
     let checkout: Checkout | null = null;
     try {
-      this.step(job, 'Checking out the PR', 10);
-      checkout = await checkoutPr(this.gh.token, job.repo, job.pr_number, job.head_sha, this.cfg.keepCheckouts);
+      const firstTime = !(await this.cache.exists(job.repo));
+      this.step(job, firstTime ? 'Downloading a local copy of the repo (first review only)' : 'Fetching new commits', 6);
+      await this.cache.fetchPr(job.repo, job.pr_number, job.head_sha, pr.baseRef, pr.baseSha);
+      if (signal.aborted) throw signal.reason;
+      this.step(job, 'Checking out the PR', 12);
+      checkout = await this.cache.worktree(job.repo, job.head_sha, this.cfg.keepCheckouts);
       if (signal.aborted) throw signal.reason;
 
       this.step(job, 'Reading the PR, linked issues and guidelines', 18);
       const previous = this.previousFindings(job);
-      const ctx = await buildContext(this.gh, this.cfg, pr, job.since_sha, previous);
+      const ctx = await buildContext(this.gh, this.cfg, pr, job.since_sha, previous, this.cache);
       this.db.event(
         job.id,
         `${ctx.incremental ? 'Follow-up review of new commits' : 'Full review'}: ${ctx.reviewFiles.length} files, ` +

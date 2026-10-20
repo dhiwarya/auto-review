@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url';
 import fastifyStatic from '@fastify/static';
 import Fastify from 'fastify';
 import { bus } from '../bus.ts';
-import { ModelSettings, saveModelSettings, type LoadedConfig } from '../config.ts';
+import { SettingsStore } from '../settings.ts';
 import type { Db } from '../db.ts';
 import type { GitHub } from '../github/client.ts';
 import { getPr } from '../github/prs.ts';
@@ -15,7 +15,8 @@ import type { Job, JobDetail, JobState, LeaderboardKind, Overview, StreamMessage
 import { leaderboard } from './leaderboard.ts';
 
 interface Deps {
-  cfg: LoadedConfig;
+  cfg: SettingsStore;
+  port: number;
   db: Db;
   gh: GitHub;
   router: Router;
@@ -25,13 +26,14 @@ interface Deps {
 
 const WEB_DIST = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../web/dist');
 
-export function overview({ cfg, db, gh, router, worker }: Deps): Overview {
+export function overview({ cfg, db, gh, router, worker, poller }: Deps): Overview {
   const counts = { queued: 0, running: 0, waiting: 0, done: 0, failed: 0, cancelled: 0, skipped: 0 } as Record<JobState, number>;
   for (const r of db.all<{ state: JobState; n: number }>('SELECT state, COUNT(*) AS n FROM jobs GROUP BY state')) counts[r.state] = r.n;
   return {
     me: gh.me,
     github_auth: gh.authSource,
     settings: { provider: cfg.models.provider, fallbackToOther: cfg.models.fallbackToOther, doubleCheck: cfg.models.doubleCheck },
+    needs_setup: cfg.needsSetup,
     dry_run: cfg.dryRun,
     default_mode: cfg.defaultMode,
     counts,
@@ -40,6 +42,13 @@ export function overview({ cfg, db, gh, router, worker }: Deps): Overview {
     last_poll_error: db.getKv('last_poll_error'),
     providers: router.status(),
     paused_reason: worker.pausedReason(),
+    github: {
+      limits: ['core', 'graphql', 'search'].flatMap((r) => (gh.rateLimits.has(r) ? [gh.rateLimits.get(r)!] : [])),
+      watching: poller.watcher.watchStatus(),
+      paused_until: poller.status().pausedUntil,
+      pause_reason: poller.status().pauseReason,
+      last_cycle: JSON.parse(db.getKv('last_poll_stats') ?? 'null'),
+    },
   };
 }
 
@@ -54,7 +63,7 @@ function parsePrRef(input: string): { repo: string; number: number } | null {
 export async function startServer(deps: Deps) {
   const { cfg, db, gh, worker, poller } = deps;
   const app = Fastify({ logger: false });
-  const port = cfg.server.port;
+  const port = deps.port;
   const allowedHosts = new Set([`127.0.0.1:${port}`, `localhost:${port}`, `[::1]:${port}`]);
 
   // The dashboard is for this machine only. Checking Host blocks DNS-rebinding pages, and
@@ -85,7 +94,7 @@ export async function startServer(deps: Deps) {
   app.post<{ Body: { pr?: string } }>('/api/jobs', async (req, reply) => {
     const ref = parsePrRef(req.body?.pr ?? '');
     if (!ref) return reply.code(400).send({ error: 'Use a PR link or owner/repo#123' });
-    if (!cfg.isRepoAllowed(ref.repo)) return reply.code(400).send({ error: `${ref.repo} isn't in repos.allow` });
+    if (!cfg.isRepoAllowed(ref.repo)) return reply.code(400).send({ error: `${ref.repo} isn't in your repos list (Settings → Repositories)` });
     try {
       const pr = await getPr(gh, ref.repo, ref.number);
       if (pr.state !== 'open') return reply.code(400).send({ error: 'That PR is not open' });
@@ -117,30 +126,21 @@ export async function startServer(deps: Deps) {
     return { ok: true };
   });
 
-  // Which provider reviews, whether the other one takes over, and the double-check.
-  // Saved to the config file and used from the next model run on.
-  app.post<{ Body: unknown }>('/api/settings', async (req, reply) => {
-    const parsed = ModelSettings.safeParse(req.body);
-    if (!parsed.success) return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? 'invalid settings' });
-    try {
-      saveModelSettings(cfg, parsed.data);
-    } catch (err) {
-      return reply.code(500).send({ error: `Couldn't save ${cfg.configPath}: ${err instanceof Error ? err.message : err}` });
-    }
-    console.log(`[settings] ${JSON.stringify(parsed.data)}`);
-    bus.overviewChanged();
-    return overview(deps).settings;
+  // All settings, edited from the dashboard. A save is validated as a whole, stored in the
+  // database, and applies to the running app straight away.
+  app.get('/api/settings', async () => ({ settings: cfg.all, defaults: SettingsStore.defaults() }));
+
+  app.put<{ Body: unknown }>('/api/settings', async (req, reply) => {
+    const result = cfg.update(req.body);
+    if (!result.ok) return reply.code(400).send({ error: 'Some settings need fixing', issues: result.issues });
+    console.log('[settings] saved');
+    return { settings: result.settings };
   });
 
   app.get<{ Params: { kind: string } }>('/api/leaderboard/:kind', async (req, reply) => {
     const kind = req.params.kind as LeaderboardKind;
     if (!['models', 'repos', 'authors'].includes(kind)) return reply.code(404).send({ error: 'unknown leaderboard' });
     return leaderboard(db, kind);
-  });
-
-  app.get('/api/config', async () => {
-    const { configPath, dataPath, ...rest } = cfg;
-    return { configPath, dataPath, ...JSON.parse(JSON.stringify(rest)) };
   });
 
   // Live updates: job changes as they happen, overview at most a few times a second.
@@ -181,6 +181,7 @@ export async function startServer(deps: Deps) {
     app.get('/', async (_req, reply) => reply.type('text/plain').send('Dashboard not built yet. Run `npm run build`, then restart.'));
   }
 
-  await app.listen({ host: cfg.server.host, port });
+  // Loopback only: the dashboard controls what gets posted to GitHub as you.
+  await app.listen({ host: '127.0.0.1', port });
   return app;
 }

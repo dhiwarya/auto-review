@@ -90,19 +90,36 @@ function Header({ overview, route }: { overview: Overview | null; route: string[
               .sort((a, b) => Number(b.provider === overview.settings.provider) - Number(a.provider === overview.settings.provider))
               .filter((p) => p.provider === overview.settings.provider || overview.settings.fallbackToOther)
               .map((p) => <ProviderPill key={p.provider} p={p} backup={p.provider !== overview.settings.provider} />)}
-          <span className="muted small" title={overview?.last_poll_error ?? undefined}>
-            {overview?.last_poll_error ? '⚠ last poll failed' : `Checked ${timeAgo(overview?.last_poll_at)}`}
+          <span
+            className="muted small"
+            title={
+              overview?.last_poll_error ??
+              (overview ? `Watching ${overview.github.watching.length} repo(s). Last check: ${overview.github.last_cycle?.requests ?? 0} request(s), ${overview.github.last_cycle?.notModified ?? 0} free.` : undefined)
+            }
+          >
+            {overview?.github.paused_until
+              ? `⚠ paused until ${clockTime(overview.github.paused_until)}`
+              : overview?.last_poll_error
+                ? '⚠ last check failed'
+                : `Checked ${timeAgo(overview?.last_poll_at)}`}
           </span>
           <button className="btn btn-small" onClick={poll} disabled={polling}>
             {polling ? 'Checking…' : 'Check now'}
           </button>
         </div>
       </div>
-      {overview?.dry_run && (
+      {overview?.needs_setup ? (
         <div className="banner">
-          <strong>Dry run.</strong> Reviews run, but nothing is posted to GitHub and no labels change. Set{' '}
-          <code>"dryRun": false</code> in <code>reviewer.config.json</code> and restart when you're ready.
+          <strong>No repositories yet.</strong> Nothing is reviewed until you list the repos to review.{' '}
+          <a href="#/settings">Open Settings</a>
         </div>
+      ) : (
+        overview?.dry_run && (
+          <div className="banner">
+            <strong>Dry run.</strong> Reviews run, but nothing is posted to GitHub and no labels change. Turn it off in{' '}
+            <a href="#/settings">Settings</a> when the reviews look right.
+          </div>
+        )
       )}
       {overview?.paused_reason && <div className="banner banner-muted">{overview.paused_reason}. Queued reviews start after that.</div>}
     </header>

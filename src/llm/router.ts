@@ -1,4 +1,4 @@
-import type { LoadedConfig } from '../config.ts';
+import type { SettingsStore } from '../settings.ts';
 import type { Db } from '../db.ts';
 import type { ModelStatus, Provider, ProviderStatus } from '../types.ts';
 import { runClaude, runCodex, type AgentTask } from './agents.ts';
@@ -23,9 +23,9 @@ const modelKey = (p: Provider, model: string | null) => `${p}/${model ?? 'defaul
 // pauses the whole provider. Pauses are remembered across restarts.
 export class Router {
   private readonly db: Db;
-  private readonly cfg: LoadedConfig;
+  private readonly cfg: SettingsStore;
 
-  constructor(db: Db, cfg: LoadedConfig) {
+  constructor(db: Db, cfg: SettingsStore) {
     this.db = db;
     this.cfg = cfg;
   }
@@ -110,13 +110,21 @@ export class Router {
             provider === 'claude'
               ? await runClaude({ ...task, model }, { claudeMaxTurns: this.cfg.limits.claudeMaxTurns, claudeEffort: this.cfg.models.claudeEffort })
               : await runCodex({ ...task, model });
-          this.db.insertRun({ job_id: jobId, purpose, provider, model, ok: 1, fell_back: fellBack ? 1 : 0, duration_ms: res.durationMs, error: null });
+          const u = res.usage;
+          this.db.insertRun({
+            job_id: jobId, purpose, provider, model, ok: 1, fell_back: fellBack ? 1 : 0, duration_ms: res.durationMs, error: null,
+            turns: u.turns, tool_calls: u.toolCalls, input_tokens: u.inputTokens, cached_input_tokens: u.cachedInputTokens,
+            output_tokens: u.outputTokens, cost_usd: u.costUsd,
+          });
           this.db.setKv(`last_error.${modelKey(provider, model)}`, null);
           this.db.setKv(`last_error.${provider}`, null);
           return { provider, model, output: res.output };
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
-          this.db.insertRun({ job_id: jobId, purpose, provider, model, ok: 0, fell_back: fellBack ? 1 : 0, duration_ms: Date.now() - started, error: message.slice(0, 500) });
+          this.db.insertRun({
+            job_id: jobId, purpose, provider, model, ok: 0, fell_back: fellBack ? 1 : 0, duration_ms: Date.now() - started, error: message.slice(0, 500),
+            turns: null, tool_calls: null, input_tokens: null, cached_input_tokens: null, output_tokens: null, cost_usd: null,
+          });
           if (task.signal?.aborted) throw err;
           if (!(err instanceof ProviderUnavailable)) throw err; // a real failure of this run; job retries handle it
           this.block(provider, model, err);

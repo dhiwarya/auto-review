@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { Finding, JobDetail, Severity } from '../../../src/types.ts';
 import { getJson, postJson, useStream, useTick } from '../api.ts';
-import { clockTime, duration, Progress, SeverityChip, shortSha, StateBadge, timeAgo } from '../ui.tsx';
+import { clockTime, compact, duration, Progress, SeverityChip, shortSha, StateBadge, timeAgo } from '../ui.tsx';
 
 const SEV_ORDER: Record<Severity, number> = { blocker: 0, major: 1, minor: 2, nit: 3 };
 
@@ -85,6 +85,10 @@ export function JobView({ id }: { id: number }) {
   const dropped = findings.filter((f) => f.status === 'dropped');
   const active = ['queued', 'running', 'waiting'].includes(job.state);
   const canRetry = ['failed', 'cancelled', 'skipped', 'waiting'].includes(job.state);
+  const ok = runs.filter((r) => r.ok);
+  const sum = (k: 'tool_calls' | 'input_tokens' | 'cached_input_tokens' | 'output_tokens') =>
+    ok.some((r) => r[k] !== null) ? ok.reduce((n, r) => n + (r[k] ?? 0), 0) : null;
+  const usage = { tools: sum('tool_calls'), input: sum('input_tokens'), cached: sum('cached_input_tokens'), output: sum('output_tokens') };
 
   return (
     <div className="stack">
@@ -115,6 +119,20 @@ export function JobView({ id }: { id: number }) {
           <span>{job.source === 'manual' ? 'added by you' : 'review requested'}</span>
           {job.attempts > 0 && <span>attempt {job.attempts + (job.state === 'running' ? 1 : 0)}</span>}
         </div>
+        {ok.length > 0 && (
+          <div className="small muted meta-line">
+            <span>
+              Model usage: {ok.length} run{ok.length > 1 ? 's' : ''}
+            </span>
+            {usage.tools !== null && <span>{usage.tools} tool calls</span>}
+            {usage.input !== null && (
+              <span>
+                {compact(usage.input)} tokens in{usage.cached ? ` (${compact(usage.cached)} cached)` : ''}
+              </span>
+            )}
+            {usage.output !== null && <span>{compact(usage.output)} tokens out</span>}
+          </div>
+        )}
 
         {active && (
           <div className="job-progress">
@@ -200,6 +218,8 @@ export function JobView({ id }: { id: number }) {
                     <th>Pass</th>
                     <th>Model</th>
                     <th>Time</th>
+                    <th title="File reads and searches (Claude) or shell commands (Codex). Turns are Claude's model round trips.">Tools</th>
+                    <th title="Tokens in (cached in brackets) / tokens out">Tokens</th>
                     <th>Result</th>
                   </tr>
                 </thead>
@@ -213,6 +233,12 @@ export function JobView({ id }: { id: number }) {
                         {r.fell_back ? <span className="small muted"> · stand-in</span> : null}
                       </td>
                       <td className="nowrap">{duration(r.duration_ms)}</td>
+                      <td className="nowrap" title={r.turns !== null ? `${r.turns} turns` : undefined}>
+                        {r.tool_calls ?? '—'}
+                      </td>
+                      <td className="nowrap" title={r.cost_usd !== null ? `About $${r.cost_usd.toFixed(2)} at API prices (not billed on a subscription)` : undefined}>
+                        {r.input_tokens !== null ? `${compact(r.input_tokens)}${r.cached_input_tokens ? ` (${compact(r.cached_input_tokens)})` : ''} / ${compact(r.output_tokens)}` : '—'}
+                      </td>
                       <td className={r.ok ? '' : 'error'} title={r.error ?? undefined}>
                         {r.ok ? 'ok' : (r.error ?? 'failed').slice(0, 60)}
                       </td>
