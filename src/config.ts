@@ -6,11 +6,10 @@ import type { Provider, ReviewMode } from './types.ts';
 
 const provider = z.enum(['claude', 'codex']);
 
-const passConfig = z.object({
-  provider,
-  // Model name passed to the CLI. null = the CLI's own default.
+// A provider's models, tried in order. null = the CLI's own default model.
+const providerModels = z.object({
   model: z.string().nullable().default(null),
-  fallback: provider.nullable().default(null),
+  fallbackModels: z.array(z.string()).default([]),
 });
 
 const ConfigSchema = z.object({
@@ -83,16 +82,22 @@ const ConfigSchema = z.object({
     }),
   models: z
     .object({
-      main: passConfig,
-      security: passConfig,
-      // Blockers and majors are re-checked by the other provider.
-      crossVerify: z.boolean().default(true),
+      // The one provider that does a whole review. Editable from the dashboard's Settings page.
+      provider: provider.default('codex'),
+      // When every model of that provider is unavailable (usage limit, not signed in), use the other one.
+      fallbackToOther: z.boolean().default(true),
+      // Re-check blockers and majors in a second, separate run before posting them.
+      doubleCheck: z.boolean().default(true),
+      claude: providerModels.default({ model: 'claude-opus-5-5', fallbackModels: ['claude-opus-4-8'] }),
+      codex: providerModels.default({ model: 'gpt-6.1-sol', fallbackModels: ['gpt-6-sol'] }),
       claudeEffort: z.enum(['low', 'medium', 'high', 'xhigh', 'max']).nullable().default(null),
     })
     .default({
-      main: { provider: 'claude', model: 'opus', fallback: 'codex' },
-      security: { provider: 'codex', model: null, fallback: 'claude' },
-      crossVerify: true,
+      provider: 'codex',
+      fallbackToOther: true,
+      doubleCheck: true,
+      claude: { model: 'claude-opus-5-5', fallbackModels: ['claude-opus-4-8'] },
+      codex: { model: 'gpt-6.1-sol', fallbackModels: ['gpt-6-sol'] },
       claudeEffort: null,
     }),
   labels: z
@@ -122,7 +127,29 @@ export interface LoadedConfig extends Config {
   isExcludedFile(file: string): boolean;
   modeFor(repo: string): ReviewMode;
   labelName(kind: 'running' | 'done' | 'blocker' | 'failed'): string;
-  otherProvider(p: Provider): Provider;
+  modelChain(p: Provider): (string | null)[];
+  providerOrder(): Provider[];
+}
+
+export const ModelSettings = z
+  .object({
+    provider,
+    fallbackToOther: z.boolean(),
+    doubleCheck: z.boolean(),
+  })
+  .partial()
+  .strict();
+export type ModelSettings = z.infer<typeof ModelSettings>;
+
+// Saves settings changed in the dashboard back to the config file, so the file stays the
+// single source of truth, and applies them to the running app straight away.
+export function saveModelSettings(cfg: LoadedConfig, patch: ModelSettings) {
+  const raw = JSON.parse(fs.readFileSync(cfg.configPath, 'utf8'));
+  raw.models = { ...(raw.models ?? {}), ...patch };
+  // Settings from before one provider did the whole review; they no longer have any effect.
+  for (const legacy of ['main', 'security', 'crossVerify']) delete raw.models[legacy];
+  fs.writeFileSync(cfg.configPath, `${JSON.stringify(raw, null, 2)}\n`);
+  Object.assign(cfg.models, patch);
 }
 
 export function loadConfig(): LoadedConfig {
@@ -155,6 +182,16 @@ export function loadConfig(): LoadedConfig {
       return hit ? hit[1] : cfg.defaultMode;
     },
     labelName: (kind) => `${cfg.labels.prefix}:${kind}`,
-    otherProvider: (p) => (p === 'claude' ? 'codex' : 'claude'),
+    // The chosen provider first, then the other one if falling back is on.
+    // Reads cfg.models on each call: it's the same object the dashboard's Settings page updates.
+    providerOrder: () => {
+      const first = cfg.models.provider;
+      const other: Provider = first === 'claude' ? 'codex' : 'claude';
+      return cfg.models.fallbackToOther ? [first, other] : [first];
+    },
+    modelChain: (p) => {
+      const m = cfg.models[p];
+      return [...new Set([m.model, ...m.fallbackModels])];
+    },
   };
 }

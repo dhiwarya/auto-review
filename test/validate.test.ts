@@ -49,6 +49,7 @@ function candidate(over: Partial<Candidate>): Candidate {
     suggestion: 'Use a parameterised query',
     pass: 'security',
     model: 'codex',
+    model_id: 'gpt-6.1-sol',
     original_severity: 'blocker',
     verification: 'not_needed',
     verified_by: null,

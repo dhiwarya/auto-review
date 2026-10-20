@@ -127,8 +127,10 @@ export class Poller {
       changed_files: pr.changedFiles,
     };
 
+    // PRs you add from the dashboard always run, including your own (handy for testing).
     const author = pr.author.toLowerCase();
-    if (author === this.gh.me.toLowerCase() || this.cfg.skipAuthors.some((a) => a.toLowerCase() === author)) {
+    const skipped = author === this.gh.me.toLowerCase() || this.cfg.skipAuthors.some((a) => a.toLowerCase() === author);
+    if (source === 'request' && skipped) {
       return this.db.insertJob({ ...base, since_sha: null, state: 'skipped', skip_reason: `author ${pr.author} is on the skip list` });
     }
 

@@ -10,6 +10,7 @@ import type { FindingOut } from './schema.ts';
 export interface Candidate extends FindingOut {
   pass: Pass;
   model: Provider;
+  model_id: string | null;
   original_severity: Severity;
   verification: Verification;
   verified_by: Provider | null;

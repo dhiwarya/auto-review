@@ -643,3 +643,67 @@ input:focus {
     max-width: 220px;
   }
 }
+
+.model-chain {
+  margin: 0;
+  padding-left: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.warn-text {
+  color: var(--warn);
+}
+.ok-text {
+  color: var(--ok);
+}
+
+.settings-card {
+  gap: 16px;
+  max-width: 720px;
+}
+.field-label {
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+.segmented {
+  display: inline-flex;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  padding: 3px;
+  background: var(--surface-2);
+  gap: 3px;
+}
+.segmented button {
+  font: inherit;
+  font-weight: 550;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  padding: 6px 18px;
+  border-radius: 7px;
+  cursor: pointer;
+}
+.segmented button.active {
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: var(--shadow), 0 0 0 1px var(--border);
+}
+.segmented button:disabled {
+  cursor: default;
+}
+.check {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  cursor: pointer;
+}
+.check input {
+  margin-top: 3px;
+  width: 16px;
+  height: 16px;
+  accent-color: var(--accent);
+}
+.block {
+  display: block;
+}

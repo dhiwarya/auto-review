@@ -4,11 +4,13 @@ A personal review agent that runs on your own machine. When someone requests you
 
 ## What a review covers
 
-| Pass | Default model | Looks for |
-| --- | --- | --- |
-| Code + requirements | Claude (`opus`) | Bugs, edge cases, error handling, concurrency, weak tests, breaking changes. It also compares the code with the linked GitHub issues: requirements that are **missing**, implemented **differently** from the issue, or **inconsistent** with the PR description. |
-| Security | Codex | Injection, auth gaps, secrets, SSRF, path traversal, unsafe deserialization, risky dependency or CI changes, each traced from input to sink. |
-| Cross-check | the other model | Every blocker and major is re-checked by the model that didn't raise it. Refuted findings are dropped, and uncertain ones are downgraded. |
+One provider does the whole review: **Codex** by default (Sol 6.1, then Sol 6), with **Claude** taking over only if Codex runs out (Opus 5.5, then Opus 4.8). You can switch providers, or turn the fallback off, on the dashboard's Settings page.
+
+| Pass | Looks for |
+| --- | --- |
+| Code + requirements | Bugs, edge cases, error handling, concurrency, weak tests, breaking changes. It also compares the code with the linked GitHub issues: requirements that are **missing**, implemented **differently** from the issue, or **inconsistent** with the PR description. |
+| Security | Injection, auth gaps, secrets, SSRF, path traversal, unsafe deserialization, risky dependency or CI changes, each traced from input to sink. |
+| Double-check | Every blocker and major is re-checked in a second, separate run. Refuted findings are dropped, and uncertain ones are downgraded. |
 
 After that, plain code (no model) checks each finding:
 - The quoted evidence must really exist in the file.
@@ -44,7 +46,7 @@ Adding labels needs triage access. If the token can't add them, the review still
 ## Safety model
 
 - **Only repos in `repos.allow`** are ever reviewed. Keep public repos where strangers open PRs out of it.
-- **Read-only agents.** Claude runs as `claude -p --restricted --tools Read,Grep,Glob`, with no MCP servers and no project settings or hooks loaded from the PR. Codex runs as `codex exec --sandbox read-only`, with no user config, no rules and no `AGENTS.md`. PR code is never built, installed or run.
+- **Read-only agents.** Claude runs as `claude -p --restricted --tools Read,Grep,Glob`, with no MCP servers and no project settings or hooks loaded from the PR, so it can only read files. Codex runs as `codex exec --sandbox read-only`, with no user config, no rules and no `AGENTS.md`. Codex works through shell commands, so its instructions forbid running, building, installing or testing anything from the repository. Its sandbox also blocks file writes and network access, and any credential that shows up in its output is dropped.
 - **The agents never see your GitHub token.** They get an allowlisted environment, and their only output is JSON. The app does all GitHub writes itself.
 - **Throwaway checkouts.** Each review gets a shallow checkout of the PR head in a temp folder, with symlinks disabled. It's deleted afterwards.
 - **Never approves and never requests changes.** Draft mode posts a pending review. Publish mode posts a plain comment review.
@@ -125,8 +127,10 @@ Settings live in `reviewer.config.json`. Restart after changes.
 | `repos.allow` / `repos.deny` | none | `owner/repo` globs |
 | `dryRun` | `true` | Review without posting |
 | `defaultMode`, `repoModes` | `draft` | `draft` or `publish`, globally or per repo |
-| `models.main`, `models.security` | Claude opus / Codex default | `{ provider, model, fallback }` |
-| `models.crossVerify` | `true` | Re-check blockers and majors with the other model |
+| `models.provider` | `codex` | Who does the whole review: `codex` or `claude`. Also on the Settings page. |
+| `models.fallbackToOther` | `true` | Use the other provider when every model of the chosen one is unavailable. Also on the Settings page. |
+| `models.doubleCheck` | `true` | Re-check blockers and majors in a second run before posting. Also on the Settings page. |
+| `models.codex`, `models.claude` | `gpt-6.1-sol` → `gpt-6-sol`; `claude-opus-5-5` → `claude-opus-4-8` | `{ model, fallbackModels }`: each provider's models, tried in order |
 | `schedule.pollIntervalSec` | `5` | How often to check GitHub for review requests. Each check is one search request (GitHub allows 30 a minute), and a PR is only re-read when it changed. |
 | `schedule.syncIntervalSec` | `60` | How often to check which comments you kept in submitted drafts |
 | `schedule.maxReviewsPerHour` | `6` | Protects your subscription limits |

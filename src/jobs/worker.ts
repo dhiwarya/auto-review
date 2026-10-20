@@ -25,6 +25,7 @@ export class Worker {
   private readonly pipeline: ReviewPipeline;
   private readonly running = new Map<number, AbortController>();
   private timer: NodeJS.Timeout | null = null;
+  private stopping = false;
 
   constructor(db: Db, cfg: LoadedConfig, pipeline: ReviewPipeline) {
     this.db = db;
@@ -41,9 +42,15 @@ export class Worker {
     this.tick();
   }
 
+  // Reviews in progress go back to the queue and start over on the next launch.
   stop() {
+    this.stopping = true;
     if (this.timer) clearInterval(this.timer);
-    for (const c of this.running.values()) c.abort(new Error('shutting down'));
+    for (const [id, c] of this.running) {
+      this.db.event(id, 'Interrupted because the app stopped; it resumes on the next start');
+      this.db.setState(id, 'queued', { step: 'Interrupted; resumes when the app starts again', progress: 0 });
+      c.abort(new Error('shutting down'));
+    }
   }
 
   pausedReason(): string | null {
@@ -57,6 +64,7 @@ export class Worker {
   }
 
   private tick() {
+    if (this.stopping) return;
     if (this.running.size >= this.cfg.schedule.concurrency) return;
     if (this.pausedReason()) return;
     const job = this.db.get<Job>(
@@ -83,6 +91,7 @@ export class Worker {
   }
 
   private async handleFailure(id: number, err: unknown, signal: AbortSignal) {
+    if (this.stopping) return; // stop() already put the job back in the queue
     const job = this.db.job(id)!;
     const message = err instanceof Error ? err.message : String(err);
 

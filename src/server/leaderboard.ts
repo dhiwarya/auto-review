@@ -8,7 +8,7 @@ function models(db: Db): Leaderboard {
     model: string; pass: string; raised: number; posted: number; refuted: number; bad_evidence: number;
     blockers: number; confirmed_blockers: number; kept: number; deleted: number;
   }>(`
-    SELECT model, pass,
+    SELECT COALESCE(model_id, model) AS model, pass,
       COUNT(*) AS raised,
       SUM(status != 'dropped') AS posted,
       SUM(verification = 'refuted') AS refuted,
@@ -17,11 +17,11 @@ function models(db: Db): Leaderboard {
       SUM(status != 'dropped' AND original_severity = 'blocker' AND verification = 'confirmed') AS confirmed_blockers,
       SUM(outcome IN ('kept', 'edited')) AS kept,
       SUM(outcome = 'deleted') AS deleted
-    FROM findings GROUP BY model, pass`);
+    FROM findings GROUP BY COALESCE(model_id, model), pass`);
   const runs = db.all<{ provider: string; purpose: string; runs: number; avg_ms: number; failed: number; fallbacks: number }>(`
-    SELECT provider, purpose, COUNT(*) AS runs, AVG(CASE WHEN ok = 1 THEN duration_ms END) AS avg_ms,
+    SELECT COALESCE(model, provider) AS provider, purpose, COUNT(*) AS runs, AVG(CASE WHEN ok = 1 THEN duration_ms END) AS avg_ms,
       SUM(ok = 0) AS failed, SUM(fell_back) AS fallbacks
-    FROM runs GROUP BY provider, purpose`);
+    FROM runs GROUP BY COALESCE(model, provider), purpose`);
 
   const rows = new Map<string, LeaderboardRow>();
   const row = (provider: string, pass: string) => {
@@ -45,10 +45,10 @@ function models(db: Db): Leaderboard {
       { key: 'runs', label: 'Runs', format: 'num' },
       { key: 'avg_ms', label: 'Avg time', format: 'ms' },
       { key: 'failed', label: 'Failed', format: 'num' },
-      { key: 'fallbacks', label: 'Stood in', hint: 'Runs where this model covered for the other one', format: 'num' },
+      { key: 'fallbacks', label: 'Stood in', hint: 'Runs where this model covered for the first-choice model', format: 'num' },
       { key: 'raised', label: 'Raised', format: 'num' },
       { key: 'posted', label: 'Posted', hint: 'Survived verification and the code checks', format: 'num' },
-      { key: 'refuted', label: 'Refuted', hint: 'Rejected by the other model', format: 'num' },
+      { key: 'refuted', label: 'Refuted', hint: 'Rejected by the double-check', format: 'num' },
       { key: 'bad_evidence', label: 'Bad evidence', hint: 'Quoted code or file that doesn\'t exist', format: 'num' },
       { key: 'blockers', label: 'Blockers', format: 'num' },
       { key: 'kept', label: 'You kept', format: 'num' },

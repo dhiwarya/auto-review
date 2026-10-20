@@ -71,6 +71,7 @@ export interface Finding {
   job_id: number;
   pass: Pass;
   model: Provider;
+  model_id: string | null; // e.g. claude-opus-5-5
   category: Category;
   severity: Severity;
   original_severity: Severity;
@@ -113,15 +114,32 @@ export interface Run {
   created_at: string;
 }
 
-export interface ProviderStatus {
-  provider: Provider;
+export interface ModelStatus {
+  model: string | null; // null = the CLI's default model
   blocked_until: string | null;
   last_error: string | null;
+}
+
+export interface ProviderStatus {
+  provider: Provider;
+  // Set when none of the provider's models can take work: the earliest time one can.
+  blocked_until: string | null;
+  last_error: string | null;
+  // The model the next run will use, if any is available.
+  active_model: string | null;
+  models: ModelStatus[]; // the fallback chain, in order
+}
+
+export interface ReviewerSettings {
+  provider: Provider;
+  fallbackToOther: boolean;
+  doubleCheck: boolean;
 }
 
 export interface Overview {
   me: string | null;
   github_auth: string;
+  settings: ReviewerSettings;
   dry_run: boolean;
   default_mode: ReviewMode;
   counts: Record<JobState, number>;

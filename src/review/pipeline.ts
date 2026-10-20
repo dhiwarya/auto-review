@@ -74,7 +74,7 @@ export class ReviewPipeline {
       const progress = () => this.db.updateJob(job.id, { progress: 25 + ++done * 22 });
       const [main, security] = await Promise.all([
         this.router
-          .run(job.id, 'main', this.cfg.models.main, this.cfg.models.main.fallback, {
+          .run(job.id, 'main', {
             ...task,
             instructions: mainInstructions(ctx.me, this.cfg.limits.maxNits),
             prompt: ctx.prompt,
@@ -82,7 +82,7 @@ export class ReviewPipeline {
           })
           .finally(progress),
         this.router
-          .run(job.id, 'security', this.cfg.models.security, this.cfg.models.security.fallback, {
+          .run(job.id, 'security', {
             ...task,
             instructions: securityInstructions(ctx.me),
             prompt: ctx.prompt,
@@ -92,16 +92,17 @@ export class ReviewPipeline {
       ]);
       const mainOut = parseReview(main.output, 'main');
       const secOut = parseReview(security.output, 'security');
-      this.db.event(job.id, `Main pass (${main.provider}): ${mainOut.findings.length} finding(s). Security pass (${security.provider}): ${secOut.findings.length} finding(s).`);
+      const label = (r: { provider: string; model: string | null }) => `${r.provider} ${r.model ?? '(default model)'}`;
+      this.db.event(job.id, `Main pass (${label(main)}): ${mainOut.findings.length} finding(s). Security pass (${label(security)}): ${secOut.findings.length} finding(s).`);
 
       let candidates: Candidate[] = [
-        ...mainOut.findings.map((f) => toCandidate(f, 'main', main.provider)),
-        ...secOut.findings.map((f) => toCandidate(f, 'security', security.provider)),
+        ...mainOut.findings.map((f) => toCandidate(f, 'main', main.provider, main.model)),
+        ...secOut.findings.map((f) => toCandidate(f, 'security', security.provider, security.model)),
       ];
 
       const placeOpts = { checkoutDir: checkout.dir, prFiles: ctx.prFiles, previous, maxNits: this.cfg.limits.maxNits };
-      if (this.cfg.models.crossVerify && candidates.some((c) => c.severity === 'blocker' || c.severity === 'major')) {
-        this.step(job, 'Cross-checking blockers and majors with the other model', 72);
+      if (this.cfg.models.doubleCheck && candidates.some((c) => c.severity === 'blocker' || c.severity === 'major')) {
+        this.step(job, 'Double-checking blockers and majors', 72);
         candidates = await this.verify(job, ctx, candidates, placeOpts, task);
       }
 
@@ -112,6 +113,7 @@ export class ReviewPipeline {
           job_id: job.id,
           pass: p.pass,
           model: p.model,
+          model_id: p.model_id,
           category: p.category,
           severity: p.severity,
           original_severity: p.original_severity,
@@ -191,50 +193,46 @@ export class ReviewPipeline {
       .filter(({ c, i }) => pre[i].status !== 'dropped' && (c.severity === 'blocker' || c.severity === 'major'));
     if (!toVerify.length) return candidates;
 
+    // A separate run with fresh context, on the same provider order as the review itself.
     const out = candidates.map((c) => ({ ...c }));
-    for (const producer of ['claude', 'codex'] as Provider[]) {
-      const batch = toVerify.filter(({ c }) => c.model === producer);
-      if (!batch.length) continue;
-      const verifier = this.cfg.otherProvider(producer);
-      const list = batch
-        .map(({ c, i }) =>
-          [`### Finding id ${i}`, `${c.severity} · ${c.category} · ${c.file}${c.line ? `:${c.line}` : ''}`, `Title: ${c.title}`, `Problem: ${c.problem}`, `Evidence:\n${c.evidence}`].join('\n'),
-        )
-        .join('\n\n');
-      try {
-        const res = await this.router.run(job.id, 'verify', { provider: verifier, model: null }, producer, {
-          ...task,
-          instructions: verifyInstructions(),
-          prompt: `${ctx.prompt}\n\n## Findings to check\n\n${list}`,
-          schema: verifySchema,
-        });
-        const parsed = VerifyOut.safeParse(res.output);
-        if (!parsed.success) throw new Error('verifier returned an unexpected shape');
-        const byId = new Map(parsed.data.verdicts.map((v) => [v.id, v]));
-        for (const { i } of batch) {
-          const v = byId.get(i);
-          const c = out[i];
-          c.verified_by = res.provider;
-          if (!v) {
-            c.verification = 'skipped';
-            continue;
-          }
-          c.verify_reason = v.reason;
-          c.verification = v.verdict;
-          if (v.verdict === 'confirmed') c.severity = minSeverity(c.severity, v.adjusted_severity);
-          if (v.verdict === 'uncertain') {
-            c.severity = lowerSeverity(c.severity);
-            c.confidence = 'low';
-          }
+    const list = toVerify
+      .map(({ c, i }) =>
+        [`### Finding id ${i}`, `${c.severity} · ${c.category} · ${c.file}${c.line ? `:${c.line}` : ''}`, `Title: ${c.title}`, `Problem: ${c.problem}`, `Evidence:\n${c.evidence}`].join('\n'),
+      )
+      .join('\n\n');
+    try {
+      const res = await this.router.run(job.id, 'verify', {
+        ...task,
+        instructions: verifyInstructions(),
+        prompt: `${ctx.prompt}\n\n## Findings to check\n\n${list}`,
+        schema: verifySchema,
+      });
+      const parsed = VerifyOut.safeParse(res.output);
+      if (!parsed.success) throw new Error('the double-check returned an unexpected shape');
+      const byId = new Map(parsed.data.verdicts.map((v) => [v.id, v]));
+      for (const { i } of toVerify) {
+        const v = byId.get(i);
+        const c = out[i];
+        c.verified_by = res.provider;
+        if (!v) {
+          c.verification = 'skipped';
+          continue;
         }
-        const refuted = batch.filter(({ i }) => out[i].verification === 'refuted').length;
-        this.db.event(job.id, `${res.provider} checked ${batch.length} ${producer} finding(s): ${refuted} refuted`);
-      } catch (err) {
-        if (task.signal.aborted) throw err;
-        for (const { i } of batch) out[i].verification = 'skipped';
-        const why = err instanceof NoProviderAvailable ? 'no model available' : err instanceof Error ? err.message : String(err);
-        this.db.event(job.id, `Couldn't cross-check ${producer}'s findings (${why}); posting them unverified`, 'warn');
+        c.verify_reason = v.reason;
+        c.verification = v.verdict;
+        if (v.verdict === 'confirmed') c.severity = minSeverity(c.severity, v.adjusted_severity);
+        if (v.verdict === 'uncertain') {
+          c.severity = lowerSeverity(c.severity);
+          c.confidence = 'low';
+        }
       }
+      const refuted = toVerify.filter(({ i }) => out[i].verification === 'refuted').length;
+      this.db.event(job.id, `${res.provider} ${res.model ?? ''} double-checked ${toVerify.length} finding(s): ${refuted} refuted`);
+    } catch (err) {
+      if (task.signal.aborted) throw err;
+      for (const { i } of toVerify) out[i].verification = 'skipped';
+      const why = err instanceof NoProviderAvailable ? 'no model available' : err instanceof Error ? err.message : String(err);
+      this.db.event(job.id, `Couldn't double-check the findings (${why}); posting them unverified`, 'warn');
     }
     return out;
   }
@@ -312,12 +310,13 @@ function parseReview(output: unknown, pass: string): ReviewOut {
   return parsed.data;
 }
 
-function toCandidate(f: ReviewOut['findings'][number], pass: 'main' | 'security', model: Provider): Candidate {
+function toCandidate(f: ReviewOut['findings'][number], pass: 'main' | 'security', model: Provider, modelId: string | null): Candidate {
   return {
     ...f,
     category: pass === 'security' ? 'security' : f.category,
     pass,
     model,
+    model_id: modelId,
     original_severity: f.severity,
     verification: 'not_needed',
     verified_by: null,

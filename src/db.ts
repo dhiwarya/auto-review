@@ -47,6 +47,7 @@ CREATE TABLE IF NOT EXISTS findings (
   job_id INTEGER NOT NULL REFERENCES jobs (id),
   pass TEXT NOT NULL,
   model TEXT NOT NULL,
+  model_id TEXT,
   category TEXT NOT NULL,
   severity TEXT NOT NULL,
   original_severity TEXT NOT NULL,
@@ -106,6 +107,16 @@ export class Db {
     this.sql = new DatabaseSync(path.join(dataPath, 'reviewer.sqlite'));
     this.sql.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;');
     this.sql.exec(SCHEMA);
+    this.migrate();
+  }
+
+  // Columns added after the first release, for databases created before them.
+  private migrate() {
+    const added: [table: string, column: string, type: string][] = [['findings', 'model_id', 'TEXT']];
+    for (const [table, column, type] of added) {
+      const cols = this.all<{ name: string }>(`PRAGMA table_info(${table})`).map((c) => c.name);
+      if (!cols.includes(column)) this.sql.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+    }
   }
 
   all<T>(query: string, ...params: SQLInputValue[]): T[] {
@@ -175,10 +186,10 @@ export class Db {
 
   insertFinding(f: Omit<Finding, 'id' | 'created_at' | 'resolved_by_job'>): Finding {
     const res = this.run(
-      `INSERT INTO findings (job_id, pass, model, category, severity, original_severity, confidence, file, line, title,
+      `INSERT INTO findings (job_id, pass, model, model_id, category, severity, original_severity, confidence, file, line, title,
          evidence, problem, suggestion, verification, verified_by, verify_reason, status, drop_reason, comment_id, outcome, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      f.job_id, f.pass, f.model, f.category, f.severity, f.original_severity, f.confidence, f.file, f.line, f.title,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      f.job_id, f.pass, f.model, f.model_id, f.category, f.severity, f.original_severity, f.confidence, f.file, f.line, f.title,
       f.evidence, f.problem, f.suggestion, f.verification, f.verified_by, f.verify_reason, f.status, f.drop_reason,
       f.comment_id, f.outcome, nowIso(),
     );

@@ -20,7 +20,8 @@ const SPEC_LABEL: Record<SpecStatus, string> = {
 const PROVIDER_NAME = { claude: 'Claude', codex: 'Codex' } as const;
 
 function provenance(f: Finding): string {
-  const parts = [`AI-assisted · ${PROVIDER_NAME[f.model]}`, `confidence ${f.confidence}`];
+  const who = f.model_id ? `${PROVIDER_NAME[f.model]} (${f.model_id})` : PROVIDER_NAME[f.model];
+  const parts = [`AI-assisted · ${who}`, `confidence ${f.confidence}`];
   if (f.verification === 'confirmed') parts.push(`confirmed by ${PROVIDER_NAME[f.verified_by ?? f.model]}`);
   if (f.verification === 'uncertain') parts.push(`unconfirmed by ${PROVIDER_NAME[f.verified_by ?? f.model]}`);
   return parts.join(' · ');

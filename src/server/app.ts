@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url';
 import fastifyStatic from '@fastify/static';
 import Fastify from 'fastify';
 import { bus } from '../bus.ts';
-import type { LoadedConfig } from '../config.ts';
+import { ModelSettings, saveModelSettings, type LoadedConfig } from '../config.ts';
 import type { Db } from '../db.ts';
 import type { GitHub } from '../github/client.ts';
 import { getPr } from '../github/prs.ts';
@@ -31,6 +31,7 @@ export function overview({ cfg, db, gh, router, worker }: Deps): Overview {
   return {
     me: gh.me,
     github_auth: gh.authSource,
+    settings: { provider: cfg.models.provider, fallbackToOther: cfg.models.fallbackToOther, doubleCheck: cfg.models.doubleCheck },
     dry_run: cfg.dryRun,
     default_mode: cfg.defaultMode,
     counts,
@@ -114,6 +115,21 @@ export async function startServer(deps: Deps) {
     if (p !== 'claude' && p !== 'codex') return reply.code(400).send({ error: 'unknown provider' });
     deps.router.clear(p);
     return { ok: true };
+  });
+
+  // Which provider reviews, whether the other one takes over, and the double-check.
+  // Saved to the config file and used from the next model run on.
+  app.post<{ Body: unknown }>('/api/settings', async (req, reply) => {
+    const parsed = ModelSettings.safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? 'invalid settings' });
+    try {
+      saveModelSettings(cfg, parsed.data);
+    } catch (err) {
+      return reply.code(500).send({ error: `Couldn't save ${cfg.configPath}: ${err instanceof Error ? err.message : err}` });
+    }
+    console.log(`[settings] ${JSON.stringify(parsed.data)}`);
+    bus.overviewChanged();
+    return overview(deps).settings;
   });
 
   app.get<{ Params: { kind: string } }>('/api/leaderboard/:kind', async (req, reply) => {

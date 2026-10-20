@@ -67,20 +67,31 @@ export function runCli(opts: {
   });
 }
 
-// Errors that mean "this provider can't take work right now", as opposed to a bad run.
+// Errors that mean "this model or provider can't take work right now", as opposed to a bad run.
+//   quota      usage limit reached (that model, or the whole plan)
+//   model      the model doesn't exist or isn't available on your plan
+//   overloaded temporary capacity problem on the provider's side
+//   auth       not signed in
+//   missing    CLI not installed
+export type UnavailableReason = 'quota' | 'model' | 'overloaded' | 'auth' | 'missing';
+
 export class ProviderUnavailable extends Error {
-  readonly reason: 'quota' | 'auth' | 'missing';
-  constructor(reason: 'quota' | 'auth' | 'missing', message: string) {
+  readonly reason: UnavailableReason;
+  constructor(reason: UnavailableReason, message: string) {
     super(message);
     this.reason = reason;
   }
 }
 
 const QUOTA = /usage limit|limit reached|hit your limit|rate.?limit|too many requests|\b429\b|quota exceeded|out of credits/i;
+const MODEL = /model\b.{0,80}(not found|does not exist|not supported|unsupported|not available|unavailable|invalid|unknown|not allowed|no access|do not have access)|(unknown|invalid|unsupported) model|no such model|model_not_found/i;
+const OVERLOADED = /overloaded|\b529\b|\b503\b|service unavailable|capacity/i;
 const AUTH = /not logged in|please log in|login required|run .*login|unauthori[sz]ed|\b401\b|invalid api key|authentication/i;
 
 export function classifyFailure(text: string): ProviderUnavailable | null {
   if (QUOTA.test(text)) return new ProviderUnavailable('quota', text.slice(0, 300));
+  if (MODEL.test(text)) return new ProviderUnavailable('model', text.slice(0, 300));
+  if (OVERLOADED.test(text)) return new ProviderUnavailable('overloaded', text.slice(0, 300));
   if (AUTH.test(text)) return new ProviderUnavailable('auth', text.slice(0, 300));
   return null;
 }

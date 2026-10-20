@@ -21,13 +21,22 @@ function useHashRoute(): string[] {
   return route;
 }
 
-function ProviderPill({ p }: { p: ProviderStatus }) {
-  const name = p.provider === 'claude' ? 'Claude' : 'Codex';
+function ProviderPill({ p, backup }: { p: ProviderStatus; backup?: boolean }) {
+  const name = `${p.provider === 'claude' ? 'Claude' : 'Codex'}${backup ? ' (backup)' : ''}`;
   const blocked = p.blocked_until !== null;
   const auth = p.last_error?.startsWith('auth') || p.last_error?.startsWith('missing');
-  const label = blocked ? (auth ? 'not signed in' : `limited until ${clockTime(p.blocked_until!)}`) : 'ready';
+  const first = p.models[0]?.model ?? null;
+  const onFallback = !blocked && p.active_model !== first;
+  const label = blocked
+    ? auth
+      ? 'not signed in'
+      : `paused until ${clockTime(p.blocked_until!)}`
+    : onFallback
+      ? `fallback ${p.active_model ?? 'default'}`
+      : (p.active_model ?? 'ready');
+  const chain = p.models.map((m) => `${m.model ?? 'default'}${m.blocked_until ? ` (paused until ${clockTime(m.blocked_until)})` : ''}`).join(' → ');
   return (
-    <span className={`pill ${blocked ? 'pill-warn' : 'pill-ok'}`} title={p.last_error ?? undefined}>
+    <span className={`pill ${blocked || onFallback ? 'pill-warn' : 'pill-ok'}`} title={[`Models: ${chain}`, p.last_error].filter(Boolean).join('\n')}>
       <span className="dot" />
       {name}: {label}
     </span>
@@ -76,7 +85,11 @@ function Header({ overview, route }: { overview: Overview | null; route: string[
               GitHub: @{overview.me}
             </a>
           )}
-          {overview?.providers.map((p) => <ProviderPill key={p.provider} p={p} />)}
+          {overview &&
+            [...overview.providers]
+              .sort((a, b) => Number(b.provider === overview.settings.provider) - Number(a.provider === overview.settings.provider))
+              .filter((p) => p.provider === overview.settings.provider || overview.settings.fallbackToOther)
+              .map((p) => <ProviderPill key={p.provider} p={p} backup={p.provider !== overview.settings.provider} />)}
           <span className="muted small" title={overview?.last_poll_error ?? undefined}>
             {overview?.last_poll_error ? '⚠ last poll failed' : `Checked ${timeAgo(overview?.last_poll_at)}`}
           </span>

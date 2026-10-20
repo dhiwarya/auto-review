@@ -35,11 +35,11 @@ function FindingCard({ f }: { f: Finding }) {
       {f.evidence && <pre className="code">{f.evidence}</pre>}
       <div className="finding-meta small muted">
         <span>
-          {f.model} · {f.pass} pass · confidence {f.confidence}
+          {f.model_id ?? f.model} · {f.pass} pass · confidence {f.confidence}
         </span>
         {f.verification !== 'not_needed' && (
           <span title={f.verify_reason ?? undefined}>
-            {f.verification === 'skipped' ? 'not cross-checked' : `${f.verification} by ${f.verified_by}`}
+            {f.verification === 'skipped' ? 'not double-checked' : `${f.verification} by ${f.verified_by}`}
           </span>
         )}
         {!dropped && <span>{f.status === 'inline' ? 'inline comment' : 'in review summary'}</span>}
