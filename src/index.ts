@@ -17,8 +17,9 @@ try {
   // .env is optional
 }
 
-// Everything else is configured in the dashboard; these two are needed before it can start.
+// Everything else is configured in the dashboard; these are needed before it can start.
 const dataPath = path.resolve(process.env.DATA_DIR || 'data');
+const host = process.env.HOST || '127.0.0.1';
 const port = Number(process.env.PORT || 4477);
 if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error(`PORT must be a port number, got "${process.env.PORT}"`);
 fs.mkdirSync(dataPath, { recursive: true });
@@ -37,7 +38,7 @@ const pipeline = new ReviewPipeline(gh, cfg, db, router, cache);
 const worker = new Worker(db, cfg, pipeline);
 const sync = new OutcomeSync(gh, cfg, db);
 const poller = new Poller(gh, cfg, db, worker, sync);
-const app = await startServer({ cfg, port, db, gh, router, worker, poller, pipeline });
+const app = await startServer({ cfg, host, port, db, gh, router, worker, poller, pipeline });
 
 worker.start();
 poller.start();

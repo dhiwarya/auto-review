@@ -17,6 +17,7 @@ import { leaderboard } from './leaderboard.ts';
 
 interface Deps {
   cfg: SettingsStore;
+  host: string;
   port: number;
   db: Db;
   gh: GitHub;
@@ -66,13 +67,14 @@ export async function startServer(deps: Deps) {
   const { cfg, db, gh, worker, poller } = deps;
   // The dashboard holds a live-updates connection open; closing must not wait for it.
   const app = Fastify({ logger: false, forceCloseConnections: true });
-  const port = deps.port;
-  const allowedHosts = new Set([`127.0.0.1:${port}`, `localhost:${port}`, `[::1]:${port}`]);
+  const loopback = new Set(['127.0.0.1', 'localhost', '[::1]']);
 
-  // The dashboard is for this machine only. Checking Host blocks DNS-rebinding pages, and
-  // requiring a custom header on writes blocks other websites from posting to the API.
+  // The dashboard is for this machine only. Checking Host blocks DNS-rebinding pages (on any
+  // port, since Docker can publish it on another one), and requiring a custom header on
+  // writes blocks other websites from posting to the API.
   app.addHook('onRequest', async (req, reply) => {
-    if (!allowedHosts.has(req.headers.host ?? '')) return reply.code(403).send({ error: 'forbidden host' });
+    const hostname = (req.headers.host ?? '').replace(/:\d+$/, '').toLowerCase();
+    if (!loopback.has(hostname)) return reply.code(403).send({ error: 'forbidden host' });
     if (req.method !== 'GET' && req.headers['x-auto-reviewer'] !== '1') return reply.code(403).send({ error: 'missing header' });
   });
 
@@ -203,7 +205,9 @@ export async function startServer(deps: Deps) {
     app.get('/', async (_req, reply) => reply.type('text/plain').send('Dashboard not built yet. Run `npm run build`, then restart.'));
   }
 
-  // Loopback only: the dashboard controls what gets posted to GitHub as you.
-  await app.listen({ host: '127.0.0.1', port });
+  // Loopback only, as the dashboard controls what gets posted to GitHub as you. In Docker it
+  // listens on all of the container's interfaces and the port is published on the host's
+  // loopback only.
+  await app.listen({ host: deps.host, port: deps.port });
   return app;
 }

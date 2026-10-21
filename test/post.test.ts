@@ -18,6 +18,7 @@ interface FakeOpts {
   labels?: readonly string[];
   myReviews?: readonly { state: string }[];
   pendingExists?: boolean;
+  token?: string;
 }
 
 // A stand-in for GitHub that records what would be posted.
@@ -25,7 +26,7 @@ function fakeGitHub(opts: FakeOpts = {}) {
   const sent = { reviews: [] as Record<string, unknown>[], labelsAdded: [] as string[], labelsRemoved: [] as string[] };
   const gh = {
     me: 'me',
-    token: 't',
+    token: opts.token ?? 't',
     rateLimits: new Map(),
     octokit: {
       paginate: async (fn: (p: unknown) => Promise<{ data: unknown[] }>, params: unknown) => (await fn(params)).data,
@@ -195,6 +196,28 @@ describe('posting a review', () => {
     const job = await pipeline(gh).postDryRun(jobId, 'publish');
     assert.equal(sent.reviews[0].event, 'COMMENT');
     assert.equal(job.approve_note, '1 blocker still open');
+  });
+
+  it("never posts the app's own credentials, wherever they turn up", async () => {
+    const token = `gho_${'S'.repeat(36)}`;
+    db.updateJob(jobId, { review_body: `Summary mentioning ${token}` });
+    const first = fakeGitHub({ token });
+    await assert.rejects(pipeline(first.gh).postDryRun(jobId, 'publish'), (e) => e instanceof PostRefused && /own credentials/.test(e.message));
+    assert.equal(first.sent.reviews.length, 0);
+
+    db.updateJob(jobId, { review_body: 'Fine' });
+    const crash = db.findings(jobId).find((f) => f.title === 'Crash')!;
+    const claude = `opaque-claude-token-${'x'.repeat(20)}`;
+    db.updateFinding(crash.id, { problem: `Leaks ${claude}` });
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = claude;
+    try {
+      const second = fakeGitHub();
+      await assert.rejects(pipeline(second.gh).postDryRun(jobId, 'draft'), /own credentials/);
+      assert.equal(second.sent.reviews.length, 0);
+    } finally {
+      delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    }
+    assert.equal(db.job(jobId)?.dry_run, 1, 'still a dry run, nothing went out');
   });
 
   it('refuses to post twice, or to a closed PR', async () => {

@@ -48,6 +48,18 @@ export function findSecrets(text: string): string[] {
 
 export const redact = (secret: string) => `${secret.slice(0, 4)}…[redacted]`;
 
+// Every line the PR adds, to tell a secret the PR itself contains from one smuggled in.
+export const addedTextOf = (prFiles: PrFile[]) => prFiles.flatMap((f) => [...parsePatch(f.patch).addedLines.values()]).join('\n');
+
+// For free text that gets posted (summaries, questions, notes): secrets are redacted, and
+// `smuggled` says whether any of them isn't in the PR, which points to prompt injection.
+export function scrubText(text: string, addedText: string): { text: string; smuggled: boolean } {
+  const secrets = findSecrets(text);
+  let out = text;
+  for (const secret of secrets) out = out.split(secret).join(redact(secret));
+  return { text: out, smuggled: secrets.some((s) => !addedText.includes(s)) };
+}
+
 export function normalizePath(file: string, checkoutDir: string): string {
   let f = file.trim().replace(/\\/g, '/');
   const root = checkoutDir.replace(/\\/g, '/');
@@ -107,7 +119,7 @@ function commentLine(c: Candidate, patch: ParsedPatch): number | null {
 export function placeFindings(candidates: Candidate[], opts: PlaceOptions): Placed[] {
   const patches = new Map<string, ParsedPatch>();
   const prFileByName = new Map(opts.prFiles.map((f) => [f.filename, f]));
-  const addedText = opts.prFiles.flatMap((f) => [...parsePatch(f.patch).addedLines.values()]).join('\n');
+  const addedText = addedTextOf(opts.prFiles);
 
   const placed: Placed[] = candidates.map((raw) => {
     const c: Placed = { ...raw, file: normalizePath(raw.file, opts.checkoutDir), status: 'inline', drop_reason: null };

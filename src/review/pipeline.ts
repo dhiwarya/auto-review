@@ -9,19 +9,23 @@ import { removeLabel, showLabel } from '../github/labels.ts';
 import { getPr, type PrInfo } from '../github/prs.ts';
 import { myVerdict, PendingReviewExists, postReview, type InlineComment, type ReviewEvent } from '../github/publish.ts';
 import { NoProviderAvailable, type Router } from '../llm/router.ts';
+import { containsSecret, ownSecrets } from '../secrets.ts';
 import type { Finding, Job, PostPreview, Provider, ReviewMode } from '../types.ts';
 import { assess, atLeast, openBlockers } from './confidence.ts';
 import { buildContext, type ReviewContext } from './context.ts';
 import { inlineBody, summaryBody } from './format.ts';
 import { mainInstructions, securityInstructions, verifyInstructions } from './prompts.ts';
 import { ReviewOut, reviewSchema, VerifyOut, verifySchema } from './schema.ts';
-import { lowerSeverity, minSeverity, placeFindings, type Candidate } from './validate.ts';
+import { addedTextOf, lowerSeverity, minSeverity, placeFindings, scrubText, type Candidate } from './validate.ts';
 
 // The job no longer needs doing: PR closed, or new commits replaced it.
 export class JobObsolete extends Error {}
 
 // Posting a dry-run review isn't possible right now; the message says why.
 export class PostRefused extends Error {}
+
+// The review contains one of the app's own credentials. Never retried.
+export class UnsafeToPost extends Error {}
 
 export class ReviewPipeline {
   private readonly gh: GitHub;
@@ -154,13 +158,27 @@ export class ReviewPipeline {
       for (const f of resolved) this.db.updateFinding(f.id, { resolved_by_job: job.id });
 
       const posted = inserted.filter((f) => f.status !== 'dropped');
-      const questions = [...mainOut.questions_for_author, ...secOut.questions_for_author].slice(0, 4);
+      // Free text is posted as written, so it gets the same secret check as the findings.
+      const addedText = addedTextOf(ctx.prFiles);
+      let smuggled = false;
+      const clean = (text: string) => {
+        const scrubbed = scrubText(text, addedText);
+        smuggled ||= scrubbed.smuggled;
+        return scrubbed.text;
+      };
+      const summaries = [clean(mainOut.summary), clean(secOut.summary)];
+      const questions = [...mainOut.questions_for_author, ...secOut.questions_for_author].slice(0, 4).map(clean);
+      const passes = [mainOut.review_confidence, secOut.review_confidence].map((p) => ({ level: p.level, reason: clean(p.reason) }));
+      const specNotes = clean(mainOut.spec_alignment.notes);
+      if (smuggled) {
+        this.db.event(job.id, 'A model put a credential that is not in the PR into its summary or questions. It was redacted; check the PR for prompt injection.', 'warn');
+      }
       const body = summaryBody({
         repo: job.repo,
         headSha: job.head_sha,
-        summaries: [mainOut.summary, secOut.summary],
+        summaries,
         specStatus: mainOut.spec_alignment.status,
-        specNotes: mainOut.spec_alignment.notes,
+        specNotes,
         issues: ctx.issues,
         findings: posted,
         questions,
@@ -177,8 +195,8 @@ export class ReviewPipeline {
         questions: questions.length,
         large: ctx.large,
         truncated: ctx.truncated,
-        injection: placed.some((p) => p.drop_reason?.includes('exfiltration')),
-        passes: [mainOut.review_confidence, secOut.review_confidence],
+        injection: smuggled || placed.some((p) => p.drop_reason?.includes('exfiltration')),
+        passes,
       });
       this.db.event(job.id, `Confidence ${assessment.level}${assessment.reasons.length ? `: ${assessment.reasons.join('; ')}` : ''}`);
       job = this.db.updateJob(job.id, {
@@ -302,6 +320,10 @@ export class ReviewPipeline {
     const inline: InlineComment[] = posted
       .filter((f) => f.status === 'inline' && f.line !== null)
       .map((f) => ({ findingId: f.id, path: f.file, line: f.line!, body: inlineBody(f) }));
+    // The last check before anything leaves: none of the app's own credentials, in any form.
+    if (containsSecret([job.review_body ?? '', ...inline.map((c) => c.body)], ownSecrets([this.gh.token]))) {
+      throw new UnsafeToPost("The review contains one of the app's own credentials, so nothing was posted. Check the PR for prompt injection.");
+    }
     const approveNote = await this.whyNotApprove(job, pr, posted);
     const approve = mode === 'publish' && approveNote === null;
     const event: ReviewEvent = mode === 'draft' ? null : approve ? 'APPROVE' : 'COMMENT';
@@ -389,6 +411,10 @@ export class ReviewPipeline {
       this.db.updateJob(id, { step: 'Dry run: not posted', progress: 100 });
       if (err instanceof PendingReviewExists) {
         throw new PostRefused('You already have an unsubmitted review on this PR. Submit or discard it on GitHub, then try again.');
+      }
+      if (err instanceof UnsafeToPost) {
+        this.db.event(id, err.message, 'error');
+        throw new PostRefused(err.message);
       }
       if (!(err instanceof PostRefused)) this.db.event(id, `Posting failed: ${err instanceof Error ? err.message : err}`, 'error');
       throw err;

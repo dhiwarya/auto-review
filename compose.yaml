@@ -1,0 +1,43 @@
+# docker compose up -d --build   start, and again after every restart of Docker, until you stop it
+# docker compose down            stop
+# docker compose logs -f         follow the log
+#
+# Sign-ins come from .env (GITHUB_TOKEN, CLAUDE_CODE_OAUTH_TOKEN) and the codex volume.
+# See "Run in Docker" in the README.
+
+services:
+  auto-reviewer:
+    build: .
+    image: auto-reviewer
+    container_name: auto-reviewer
+    restart: unless-stopped
+    # Reaps the CLI processes the reviews start, and passes Docker's stop signal on.
+    init: true
+    stop_grace_period: 15s
+    # Codex runs each command in its own read-only, offline sandbox (bubblewrap), which needs
+    # the namespaces Docker's default seccomp profile blocks. So seccomp is off, and instead
+    # the container has no capabilities at all and can't gain privileges.
+    security_opt:
+      - seccomp=unconfined
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      HOST: 0.0.0.0
+      PORT: ${PORT:-4477}
+      DATA_DIR: /app/data
+      TZ: ${TZ:-UTC}
+    # Only this machine can open the dashboard.
+    ports:
+      - "127.0.0.1:${PORT:-4477}:${PORT:-4477}"
+    volumes:
+      - ./data:/app/data
+      - claude:/home/node/.claude
+      - codex:/home/node/.codex
+
+volumes:
+  claude:
+  codex:

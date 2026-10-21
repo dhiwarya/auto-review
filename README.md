@@ -64,7 +64,8 @@ A published review **approves the PR** when no blocker is open (in this review o
 
 - **Only the repos you list in Settings** are ever reviewed. Keep public repos where strangers open PRs out of that list.
 - **Read-only agents.** Claude runs as `claude -p --restricted --tools Read,Grep,Glob`, with no MCP servers and no project settings or hooks loaded from the PR, so it can only read files. Codex runs as `codex exec --sandbox read-only`, with no user config, no rules and no `AGENTS.md`. Codex works through shell commands, so its instructions forbid running, building, installing or testing anything from the repository. Its sandbox also blocks file writes and network access, and any credential that shows up in its output is dropped.
-- **The agents never see your GitHub token.** They get an allowlisted environment, and their only output is JSON. The app does all GitHub writes itself.
+- **The agents never get your GitHub token.** They get an allowlisted environment, and their only output is JSON. The app does all GitHub writes itself.
+- **Nothing posted can carry a credential.** Every finding, summary, question and note is checked for secret formats (GitHub, Anthropic, OpenAI, AWS, Slack, private keys, JWTs). A secret the PR doesn't add itself is redacted and lowers the confidence to low. Right before posting, the whole review is also checked against the app's own credentials, word for word: the GitHub token, the Claude token and the Codex and Claude login files. A match stops the post and fails the review.
 - **Throwaway checkouts.** Each review gets its own worktree of the PR head in a temp folder, made from the local repo copy, with symlinks disabled. It's deleted afterwards. Your GitHub token is passed to git through the environment and never written into the local copy.
 - **Approves only under strict rules, never requests changes.** Draft mode posts a pending review. Publish mode approves when the rules in [Confidence and approval](#confidence-and-approval) allow it, and posts a comment review otherwise. Text in a PR can't raise the confidence: the hard rules are checked by the app, not the model.
 - **Local dashboard.** It listens on `127.0.0.1` only, rejects foreign `Host` headers (DNS rebinding), and requires a custom header on every write (CSRF).
@@ -117,6 +118,42 @@ It starts in **dry run**: reviews run and appear in the dashboard, but nothing i
 | macOS | `sh deploy/macos/install.sh` (remove with `sh deploy/macos/install.sh remove`). Logs go to `data/reviewer.log`. |
 | Linux | Follow the steps at the top of `deploy/linux/auto-reviewer.service` (systemd user service) |
 | Windows | `powershell -ExecutionPolicy Bypass -File deploy\windows\install.ps1` (Task Scheduler) |
+
+### Run in Docker
+
+The image has everything the app runs: Node, git, ripgrep, Claude Code and Codex. Docker keeps it running, and starts it again with Docker, until you stop it. Only Docker is needed on the machine.
+
+Sign in once. A container can't use your computer's own logins, so each tool gets its own:
+
+1. GitHub: put a token in `.env`. The quickest is your `gh` login; a fine-grained token (scopes in `.env.example`) is safer.
+
+   ```bash
+   echo "GITHUB_TOKEN=$(gh auth token)" >> .env
+   ```
+
+2. Claude: run `claude setup-token` on your computer. It opens the browser and prints a long-lived token for your subscription. Add it to `.env` as `CLAUDE_CODE_OAUTH_TOKEN=…`.
+
+3. Codex: sign in inside the container. It shows a code to enter at a link, and keeps the login in a Docker volume.
+
+   ```bash
+   docker compose run --rm auto-reviewer codex login --device-auth
+   ```
+
+4. Set `TZ` in `.env` to your time zone, for example `TZ=Europe/Berlin`, so the pause window uses your local time.
+
+Then:
+
+| To | Run |
+| --- | --- |
+| Start | `docker compose up -d --build` (or `npm run up`) |
+| Stop | `docker compose down` (or `npm run down`) |
+| Follow the log | `docker compose logs -f` (or `npm run logs`) |
+
+The dashboard is at http://127.0.0.1:4477, published on this machine's loopback only. The `data` folder is shared with the container, so settings and history are the same as with `npm start`. Run only one of the two at a time. Stopping keeps queued and interrupted reviews; they continue on the next start.
+
+The CLI versions are pinned in the `Dockerfile` (`CLAUDE_CODE_VERSION`, `CODEX_VERSION`). Change them and start again with `--build` to update. On Linux, the container runs as user ID 1000, so the `data` folder must be writable by it.
+
+Codex runs each command in a read-only, offline sandbox, which needs Linux namespaces that Docker's default seccomp profile blocks. So `compose.yaml` turns seccomp off for this container, and in exchange drops every capability and blocks privilege escalation. On Linux hosts that restrict unprivileged user namespaces through AppArmor (Ubuntu 23.10 and later), also add `apparmor=unconfined` under `security_opt`.
 
 ## Dashboard
 

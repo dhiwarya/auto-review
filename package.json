@@ -13,7 +13,10 @@
     "dev:web": "vite --config web/vite.config.ts",
     "build": "vite build --config web/vite.config.ts",
     "typecheck": "tsc -p tsconfig.json && tsc -p web/tsconfig.json",
-    "test": "node --test test/*.test.ts"
+    "test": "node --test test/*.test.ts",
+    "up": "docker compose up -d --build",
+    "down": "docker compose down",
+    "logs": "docker compose logs -f"
   },
   "dependencies": {
     "@fastify/static": "^10.1.6",

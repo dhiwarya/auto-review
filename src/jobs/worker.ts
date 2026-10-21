@@ -3,7 +3,7 @@ import { nowIso, type Db } from '../db.ts';
 import { HeadMovedError } from '../git/mirror.ts';
 import { PendingReviewExists } from '../github/publish.ts';
 import { NoProviderAvailable } from '../llm/router.ts';
-import { JobObsolete, type ReviewPipeline } from '../review/pipeline.ts';
+import { JobObsolete, UnsafeToPost, type ReviewPipeline } from '../review/pipeline.ts';
 import { bus } from '../bus.ts';
 import type { Job } from '../types.ts';
 
@@ -105,6 +105,12 @@ export class Worker {
       this.db.event(id, `Stopped: ${message}`);
       this.db.setState(id, 'cancelled', { step: `Stopped: ${message}`, skip_reason: 'obsolete' });
       await this.pipeline.labelCancelled(job).catch(() => {});
+      return;
+    }
+    if (err instanceof UnsafeToPost) {
+      this.db.event(id, message, 'error');
+      this.db.setState(id, 'failed', { error: message, step: 'Failed' });
+      await this.pipeline.labelFailed(job).catch(() => {});
       return;
     }
     if (err instanceof NoProviderAvailable) {
