@@ -74,14 +74,16 @@ export function LeaderboardPage({ kind }: { kind: LeaderboardKind }) {
 
   return (
     <div className="stack">
-      <nav className="subtabs" aria-label="Leaderboards">
-        {TABS.map((t) => (
-          <a key={t.kind} href={`#/leaderboard/${t.kind}`} className={t.kind === tab.kind ? 'active' : ''}>
-            {t.label}
-          </a>
-        ))}
-      </nav>
-      <p className="muted">{tab.blurb}</p>
+      <div className="page-intro">
+        <nav className="subtabs" aria-label="Leaderboards">
+          {TABS.map((t) => (
+            <a key={t.kind} href={`#/leaderboard/${t.kind}`} className={t.kind === tab.kind ? 'active' : ''}>
+              {t.label}
+            </a>
+          ))}
+        </nav>
+        <p className="muted">{tab.blurb}</p>
+      </div>
       {!data ? (
         <p className="empty">Loading…</p>
       ) : rows.length === 0 ? (

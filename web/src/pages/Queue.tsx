@@ -100,14 +100,16 @@ export function QueuePage({ overview }: { overview: Overview | null }) {
           <div className="grid">{active.map((j) => <ActiveCard key={j.id} job={j} />)}</div>
         ) : (
           <p className="empty">
-            {loaded ? `Nothing to review. Checking GitHub every few minutes for PRs that request @${overview?.me ?? 'you'}.` : 'Loading…'}
+            {loaded ? `Nothing to review. Watching GitHub for PRs that request @${overview?.me ?? 'you'}.` : 'Loading…'}
           </p>
         )}
         <ReviewNow />
       </section>
 
       <section>
-        <h2>History</h2>
+        <h2>
+          History {history.length > 0 && <span className="count">{history.length}</span>}
+        </h2>
         {history.length ? (
           <div className="table-wrap">
             <table className="table clickable">
@@ -128,7 +130,9 @@ export function QueuePage({ overview }: { overview: Overview | null }) {
                       <a href={`#/jobs/${j.id}`} className="repo">
                         {j.repo}#{j.pr_number}
                       </a>
-                      <div className="truncate">{j.pr_title}</div>
+                      <div className="truncate" title={j.pr_title}>
+                        {j.pr_title}
+                      </div>
                     </td>
                     <td>@{j.author}</td>
                     <td>

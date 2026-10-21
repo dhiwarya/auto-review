@@ -5,7 +5,7 @@ import { JobView } from './pages/JobView.tsx';
 import { LeaderboardPage } from './pages/Leaderboard.tsx';
 import { QueuePage } from './pages/Queue.tsx';
 import { SettingsPage } from './pages/Settings.tsx';
-import { clockTime, timeAgo } from './ui.tsx';
+import { clockTime, ThemeToggle, timeAgo } from './ui.tsx';
 
 function useHashRoute(): string[] {
   const read = () => window.location.hash.replace(/^#\/?/, '').split('/').filter(Boolean);
@@ -40,6 +40,20 @@ function ProviderPill({ p, backup }: { p: ProviderStatus; backup?: boolean }) {
       <span className="dot" />
       {name}: {label}
     </span>
+  );
+}
+
+// The provider that reviews. The backup shows up only when it's standing in, or has a problem.
+function Providers({ overview }: { overview: Overview }) {
+  const { provider, fallbackToOther } = overview.settings;
+  const primary = overview.providers.find((p) => p.provider === provider);
+  const backup = overview.providers.find((p) => p.provider !== provider);
+  const showBackup = fallbackToOther && backup && (primary?.blocked_until || backup.blocked_until);
+  return (
+    <>
+      {primary && <ProviderPill p={primary} />}
+      {showBackup && <ProviderPill p={backup} backup />}
+    </>
   );
 }
 
@@ -81,15 +95,10 @@ function Header({ overview, route }: { overview: Overview | null; route: string[
               rel="noreferrer"
               title={`Reviewing PRs that request @${overview.me}. Login from ${overview.github_auth}.`}
             >
-              <span className="dot" />
-              GitHub: @{overview.me}
+              <span className="dot" />@{overview.me}
             </a>
           )}
-          {overview &&
-            [...overview.providers]
-              .sort((a, b) => Number(b.provider === overview.settings.provider) - Number(a.provider === overview.settings.provider))
-              .filter((p) => p.provider === overview.settings.provider || overview.settings.fallbackToOther)
-              .map((p) => <ProviderPill key={p.provider} p={p} backup={p.provider !== overview.settings.provider} />)}
+          {overview && <Providers overview={overview} />}
           <span
             className="muted small"
             title={
@@ -98,14 +107,15 @@ function Header({ overview, route }: { overview: Overview | null; route: string[
             }
           >
             {overview?.github.paused_until
-              ? `⚠ paused until ${clockTime(overview.github.paused_until)}`
+              ? `\u26A0\uFE0E Paused until ${clockTime(overview.github.paused_until)}`
               : overview?.last_poll_error
-                ? '⚠ last check failed'
+                ? '\u26A0\uFE0E Last check failed'
                 : `Checked ${timeAgo(overview?.last_poll_at)}`}
           </span>
-          <button className="btn btn-small" onClick={poll} disabled={polling}>
+          <button className="btn btn-ghost btn-small" onClick={poll} disabled={polling}>
             {polling ? 'Checking…' : 'Check now'}
           </button>
+          <ThemeToggle />
         </div>
       </div>
       {overview?.needs_setup ? (

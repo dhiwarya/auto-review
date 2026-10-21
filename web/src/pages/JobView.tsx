@@ -178,10 +178,10 @@ export function JobView({ id }: { id: number }) {
 
   return (
     <div className="stack">
-      <a href="#/" className="back small">
-        ← Queue
-      </a>
       <section className="job-head">
+        <a href="#/" className="back small">
+          ← Queue
+        </a>
         <div className="card-top">
           <StateBadge state={job.state} />
           <a className="repo" href={job.pr_url} target="_blank" rel="noreferrer">
@@ -274,19 +274,19 @@ export function JobView({ id }: { id: number }) {
 
       <section>
         <h2>
-          Findings <span className="muted">({posted.length})</span>
+          Findings <span className="count">{posted.length}</span>
         </h2>
         {posted.length ? (
-          <div className="stack-sm">{posted.map((f) => <FindingCard key={f.id} f={f} />)}</div>
+          <div className="findings">{posted.map((f) => <FindingCard key={f.id} f={f} />)}</div>
         ) : (
           <p className="empty">{job.state === 'done' ? 'Nothing worth raising.' : 'No findings yet.'}</p>
         )}
         {dropped.length > 0 && (
           <>
-            <button className="btn btn-ghost btn-small" onClick={() => setShowDropped((v) => !v)}>
+            <button className="btn btn-ghost btn-small toggle-dropped" onClick={() => setShowDropped((v) => !v)}>
               {showDropped ? 'Hide' : 'Show'} {dropped.length} discarded finding{dropped.length > 1 ? 's' : ''}
             </button>
-            {showDropped && <div className="stack-sm">{dropped.map((f) => <FindingCard key={f.id} f={f} />)}</div>}
+            {showDropped && <div className="findings toggle-dropped">{dropped.map((f) => <FindingCard key={f.id} f={f} />)}</div>}
           </>
         )}
       </section>
@@ -297,7 +297,7 @@ export function JobView({ id }: { id: number }) {
           <ol className="timeline">
             {events.map((e) => (
               <li key={e.id} className={`ev-${e.level}`}>
-                <span className="muted small nowrap">{clockTime(e.created_at)}</span>
+                <time dateTime={e.created_at}>{clockTime(e.created_at)}</time>
                 <span>{e.message}</span>
               </li>
             ))}
@@ -322,7 +322,7 @@ export function JobView({ id }: { id: number }) {
                   {runs.map((r) => (
                     <tr key={r.id}>
                       <td>{r.purpose}</td>
-                      <td>
+                      <td className="nowrap">
                         {r.provider}
                         {r.model ? ` (${r.model})` : ''}
                         {r.fell_back ? <span className="small muted"> · stand-in</span> : null}

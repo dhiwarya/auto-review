@@ -12,12 +12,12 @@ const lines = (text: string) => text.split('\n').map((l) => l.trim()).filter(Boo
 
 function Section({ title, description, children }: { title: string; description?: string; children: ReactNode }) {
   return (
-    <section className="card settings-section">
+    <section className="settings-section">
       <div>
         <h2>{title}</h2>
         {description && <p className="small muted section-desc">{description}</p>}
       </div>
-      {children}
+      <div className="section-body">{children}</div>
     </section>
   );
 }
@@ -252,12 +252,12 @@ export function SettingsPage({ overview }: { overview: Overview | null }) {
               <div key={l.resource} className="limit">
                 <div className="small">
                   <strong>{l.resource}</strong>{' '}
-                  <span className="muted">
+                  <span className={l.remaining / l.limit < 0.1 ? 'warn-text' : 'muted'}>
                     {l.remaining.toLocaleString()} of {l.limit.toLocaleString()} left · resets {clockTime(l.reset)}
                   </span>
                 </div>
                 <div className="progress">
-                  <div style={{ width: `${Math.max(2, (l.remaining / l.limit) * 100)}%`, background: l.remaining / l.limit < 0.1 ? 'var(--danger)' : undefined }} />
+                  <div style={{ width: `${Math.max(2, (l.remaining / l.limit) * 100)}%` }} />
                 </div>
               </div>
             ))}
