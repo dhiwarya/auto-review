@@ -88,7 +88,16 @@ const MODEL = /model\b.{0,80}(not found|does not exist|not supported|unsupported
 const OVERLOADED = /overloaded|\b529\b|\b503\b|service unavailable|capacity/i;
 const AUTH = /not logged in|please log in|login required|run .*login|unauthori[sz]ed|\b401\b|invalid api key|authentication/i;
 
-export function classifyFailure(text: string): ProviderUnavailable | null {
+// The provider's safety filter declined this run's content, for example OpenAI flagging a
+// security review as possible cybersecurity risk. It's about the PR, not the model, so
+// nothing gets paused: the next model in line gets the same run.
+export class ContentRefused extends Error {}
+
+const REFUSED = /flagged for possible cybersecurity risk|content was flagged|violates? (our|the) usage policy/i;
+
+export function classifyFailure(text: string): ProviderUnavailable | ContentRefused | null {
+  // First: OpenAI's refusal says "some cybersecurity requests are still limited".
+  if (REFUSED.test(text)) return new ContentRefused(`declined by the safety filter: ${text.slice(-300)}`);
   if (QUOTA.test(text)) return new ProviderUnavailable('quota', text.slice(0, 300));
   if (MODEL.test(text)) return new ProviderUnavailable('model', text.slice(0, 300));
   if (OVERLOADED.test(text)) return new ProviderUnavailable('overloaded', text.slice(0, 300));

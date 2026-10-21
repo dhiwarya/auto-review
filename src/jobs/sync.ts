@@ -77,7 +77,7 @@ export class OutcomeSync {
       this.db.updateFinding(f.id, { outcome });
     }
     this.db.updateJob(job.id, { review_state: review.state });
-    this.db.event(job.id, `You submitted the review (${review.state.toLowerCase()}): kept ${kept} of ${findings.length} finding(s)`);
+    this.db.event(job.id, `You submitted the review (${review.state.toLowerCase()})${findings.length ? `: kept ${kept} of ${findings.length} finding(s)` : ''}`);
 
     const pr = await getPr(this.gh, job.repo, job.pr_number);
     await showLabel(this.gh, job.repo, job.pr_number, this.cfg.labels, review.state === 'APPROVED' ? 'approved' : 'feedback', pr.labels);

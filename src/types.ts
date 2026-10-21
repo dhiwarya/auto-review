@@ -15,6 +15,11 @@ export type JobState =
 
 export const ACTIVE_STATES: JobState[] = ['queued', 'running', 'waiting'];
 
+// review: reads the code (all of it, or the commits since the last review).
+// recheck: the review was requested again with no new commits, so it re-checks the
+// findings still open from earlier reviews instead of reviewing the code again.
+export type JobKind = 'review' | 'recheck';
+
 export type Severity = 'blocker' | 'major' | 'minor' | 'nit';
 export const SEVERITIES: Severity[] = ['blocker', 'major', 'minor', 'nit'];
 
@@ -39,6 +44,7 @@ export interface Job {
   head_sha: string;
   base_sha: string;
   since_sha: string | null;
+  kind: JobKind;
   mode: ReviewMode;
   source: 'request' | 'manual';
   dry_run: number;
@@ -206,7 +212,9 @@ export interface PostPreview {
   reviewedSha: string;
   currentSha: string;
   defaultMode: ReviewMode;
-  // Publishing approves the PR when approveNote is null.
+  // Publishing approves the PR when approveNote is null, and requests changes when
+  // requestChanges is set (a re-check with blockers or majors still open).
   approveNote: string | null;
+  requestChanges: boolean;
   labels: Record<ReviewMode, string>;
 }

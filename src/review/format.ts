@@ -81,3 +81,42 @@ export function summaryBody(s: SummaryInput): string {
   out.push(SIGNATURE, `<!-- ai-review sha=${s.headSha} job=${s.jobId} -->`);
   return out.join('\n');
 }
+
+export interface RecheckInput {
+  headSha: string;
+  summary: string;
+  open: { finding: Finding; reason: string }[];
+  resolved: { finding: Finding; reason: string }[];
+  jobId: number;
+}
+
+// A re-check after the review was requested again without new commits: which earlier
+// findings are still open, and which turned out not to hold.
+export function recheckBody(r: RecheckInput): string {
+  const lead = `**No new commits since the last review (\`${r.headSha.slice(0, 7)}\`).**`;
+  const out: string[] = [];
+  if (r.open.length) {
+    const n = r.open.length;
+    out.push(`${lead} ${n} finding${n > 1 ? 's' : ''} from earlier reviews ${n > 1 ? 'are' : 'is'} still open: ${countsLine(r.open.map((o) => o.finding))}.`, '');
+  } else {
+    out.push(`${lead} ${r.resolved.length ? 'Every finding from earlier reviews is resolved.' : 'No findings from earlier reviews are open.'}`, '');
+  }
+  if (r.summary.trim()) out.push(r.summary.trim(), '');
+
+  if (r.open.length) {
+    out.push('**Still open**', '');
+    for (const { finding: f, reason } of r.open) {
+      out.push(`- ${heading(f)}${f.file ? ` (\`${f.file}${f.line ? `:${f.line}` : ''}\`)` : ''}`);
+      if (reason.trim()) out.push(`  ${oneLine(reason)}`);
+    }
+    out.push('');
+  }
+  if (r.resolved.length) {
+    out.push('**Resolved**', '');
+    for (const { finding: f, reason } of r.resolved) out.push(`- ~~${f.title}~~${f.file ? ` (\`${f.file}\`)` : ''}${reason.trim() ? `: ${oneLine(reason)}` : ''}`);
+    out.push('');
+  }
+
+  out.push(SIGNATURE, `<!-- ai-review sha=${r.headSha} job=${r.jobId} recheck -->`);
+  return out.join('\n');
+}

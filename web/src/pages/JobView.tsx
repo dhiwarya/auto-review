@@ -59,6 +59,7 @@ function Verdict({ job }: { job: Job }) {
   const notes = job.confidence_notes?.split('\n').filter(Boolean) ?? [];
   let outcome: string | null = null;
   if (job.review_state === 'APPROVED') outcome = 'Approved';
+  else if (job.review_state === 'CHANGES_REQUESTED') outcome = `Changes requested${job.approve_note ? `: ${job.approve_note}` : ''}`;
   else if (job.dry_run) outcome = null;
   else if (job.approve_note) outcome = `Not approved: ${job.approve_note}`;
   else if (job.mode === 'draft' && job.review_state === 'PENDING') outcome = 'No blockers: you can approve it when you submit the draft';
@@ -103,6 +104,7 @@ function PostPanel({ job, onClose }: { job: Job; onClose: () => void }) {
 
   const moved = preview && preview.currentSha !== preview.reviewedSha;
   const approves = mode === 'publish' && preview?.approveNote === null;
+  const requests = mode === 'publish' && preview?.requestChanges;
 
   return (
     <div className="post-panel">
@@ -123,11 +125,13 @@ function PostPanel({ job, onClose }: { job: Job; onClose: () => void }) {
             <label className={`post-mode ${mode === 'publish' ? 'active' : ''}`}>
               <input type="radio" name="mode" checked={mode === 'publish'} onChange={() => setMode('publish')} />
               <span>
-                <strong>{preview.approveNote === null ? 'Publish and approve' : 'Publish'}</strong>
+                <strong>{preview.requestChanges ? 'Publish and request changes' : preview.approveNote === null ? 'Publish and approve' : 'Publish'}</strong>
                 <span className="small muted block">
-                  {preview.approveNote === null
-                    ? 'Posted now under your name and approves the PR. Visible to the author and everyone on the repo.'
-                    : 'Posted now as a comment review under your name, visible to the author and everyone on the repo.'}
+                  {preview.requestChanges
+                    ? 'Posted now under your name and requests changes on the PR. Visible to the author and everyone on the repo.'
+                    : preview.approveNote === null
+                      ? 'Posted now under your name and approves the PR. Visible to the author and everyone on the repo.'
+                      : 'Posted now as a comment review under your name, visible to the author and everyone on the repo.'}
                 </span>
               </span>
             </label>
@@ -137,7 +141,11 @@ function PostPanel({ job, onClose }: { job: Job; onClose: () => void }) {
             {preview.inSummary ? ` and ${preview.inSummary} finding${preview.inSummary === 1 ? '' : 's'} in the summary` : ''}, and sets the label{' '}
             <code>{preview.labels[mode]}</code>
           </div>
-          {mode === 'publish' && preview.approveNote && <div className="small muted">Won't approve: {preview.approveNote}.</div>}
+          {mode === 'publish' && preview.approveNote && (
+            <div className="small muted">
+              {preview.requestChanges ? 'Requests changes' : "Won't approve"}: {preview.approveNote}.
+            </div>
+          )}
           {moved && (
             <div className="small warn-text">
               The PR has new commits since this review ({shortSha(preview.reviewedSha)} → {shortSha(preview.currentSha)}). Comments go on the
@@ -153,7 +161,7 @@ function PostPanel({ job, onClose }: { job: Job; onClose: () => void }) {
         </button>
         {preview && (
           <button className="btn" onClick={post} disabled={posting}>
-            {posting ? 'Posting…' : mode === 'draft' ? 'Post draft' : approves ? 'Publish and approve' : 'Publish review'}
+            {posting ? 'Posting…' : mode === 'draft' ? 'Post draft' : requests ? 'Publish and request changes' : approves ? 'Publish and approve' : 'Publish review'}
           </button>
         )}
       </div>
@@ -168,7 +176,17 @@ export function JobView({ id }: { id: number }) {
   const [showDropped, setShowDropped] = useState(false);
   const [showPreview, setShowPreview] = useState(false);
   const [showPost, setShowPost] = useState(false);
+  const [recheckError, setRecheckError] = useState<string | null>(null);
   const refetchTimer = useRef<number | null>(null);
+
+  const recheck = () => {
+    setRecheckError(null);
+    postJson<Job>(`/api/jobs/${id}/recheck`)
+      .then((j) => {
+        location.hash = `#/jobs/${j.id}`;
+      })
+      .catch((e) => setRecheckError(e instanceof Error ? e.message : String(e)));
+  };
 
   const load = useCallback(() => {
     getJson<JobDetail>(`/api/jobs/${id}`)
@@ -218,11 +236,15 @@ export function JobView({ id }: { id: number }) {
           <span>@{job.author}</span>
           <span>
             commit <code>{shortSha(job.head_sha)}</code>
-            {job.since_sha && (
-              <>
-                {' '}
-                (follow-up since <code>{shortSha(job.since_sha)}</code>)
-              </>
+            {job.kind === 'recheck' ? (
+              ' (re-check of open findings, no new commits)'
+            ) : (
+              job.since_sha && (
+                <>
+                  {' '}
+                  (follow-up since <code>{shortSha(job.since_sha)}</code>)
+                </>
+              )
             )}
           </span>
           <span>+{job.additions} −{job.deletions} in {job.changed_files} files</span>
@@ -257,6 +279,7 @@ export function JobView({ id }: { id: number }) {
           </div>
         )}
         {job.state === 'failed' && <div className="error small">{job.error}</div>}
+        {recheckError && <div className="error small">{recheckError}</div>}
         {job.state === 'skipped' && <div className="small muted">{job.skip_reason}</div>}
 
         <div className="actions">
@@ -278,6 +301,11 @@ export function JobView({ id }: { id: number }) {
           {canRetry && (
             <button className="btn btn-ghost" onClick={() => postJson(`/api/jobs/${id}/retry`)}>
               Retry
+            </button>
+          )}
+          {job.state === 'done' && (
+            <button className="btn btn-ghost" onClick={recheck} title="Re-check the open findings on this commit, as if the review was requested again">
+              Re-check
             </button>
           )}
           {active && (

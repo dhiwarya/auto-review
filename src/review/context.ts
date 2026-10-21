@@ -7,9 +7,11 @@ import {
   getLinkedIssues,
   listPrFiles,
   type LinkedIssue,
+  type PrComment,
   type PrFile,
   type PrInfo,
 } from '../github/prs.ts';
+import { SIGNATURE } from '../github/publish.ts';
 import type { Finding } from '../types.ts';
 
 export interface ReviewContext {
@@ -35,6 +37,52 @@ const fence = (kind: string, text: string) =>
   `<untrusted kind="${kind}">\n${text.replace(/<\/?untrusted/gi, (m) => m.replace('untrusted', 'untrusted_'))}\n</untrusted>`;
 
 const GUIDELINE_FILES = ['CLAUDE.md', 'AGENTS.md', 'CONTRIBUTING.md', '.github/CONTRIBUTING.md'];
+
+function issuesSection(issues: LinkedIssue[]): string {
+  if (!issues.length) return 'Linked issues: none found.';
+  const text = issues
+    .map((i) => {
+      const comments = i.comments.length
+        ? `\n### Comments\n${i.comments.map((c) => `- @${c.author}: ${clip(c.body, 1000)}`).join('\n')}`
+        : '';
+      return `## ${i.repo}#${i.number}: ${i.title}\n${clip(i.body || '(no description)', 6000)}${comments}`;
+    })
+    .join('\n\n');
+  return fence('linked-issues', text);
+}
+
+// The re-check's prompt: the findings still open, each with the replies in its thread,
+// and the PR conversation since the last review. Comments the app wrote are left out.
+export function recheckPrompt(pr: PrInfo, findings: Finding[], discussion: PrComment[], issues: LinkedIssue[]): string {
+  const said = discussion.filter((c) => !c.body.includes(SIGNATURE));
+  const quote = (cs: PrComment[]) => clip(cs.map((c) => `@${c.author} (${c.createdAt}): ${clip(c.body, 2000)}`).join('\n\n'), 8000);
+
+  const parts: string[] = [];
+  parts.push(`# Pull request ${pr.repo}#${pr.number}`);
+  parts.push(
+    `Author: ${pr.author}. Head: ${pr.headRef} (${pr.headSha.slice(0, 7)}). You reviewed this commit before, and there are no new commits since.`,
+  );
+  parts.push(fence('pr-title-and-description', `Title: ${pr.title}\n\n${clip(pr.body || '(no description)', 8000)}`));
+  parts.push(issuesSection(issues));
+
+  const list = findings.map((f) => {
+    const replies = f.comment_id ? said.filter((c) => c.inReplyTo === f.comment_id) : [];
+    return [
+      `### Finding id ${f.id}`,
+      `${f.severity} · ${f.category} · ${f.file}${f.line ? `:${f.line}` : ''}`,
+      `Title: ${f.title}`,
+      `Problem: ${f.problem}`,
+      `Evidence:\n${f.evidence}`,
+      `Suggestion: ${f.suggestion}`,
+      replies.length ? fence('replies-in-this-finding-thread', quote(replies)) : 'No replies in its thread.',
+    ].join('\n');
+  });
+  parts.push(`## Findings still open (${findings.length})\n\n${list.join('\n\n')}`);
+
+  const conversation = said.filter((c) => c.inReplyTo === null);
+  parts.push(conversation.length ? fence('pr-conversation since the last review', quote(conversation)) : 'No PR conversation since the last review.');
+  return parts.join('\n\n');
+}
 
 export async function buildContext(
   gh: GitHub,
@@ -113,19 +161,7 @@ export async function buildContext(
 
   parts.push(fence('pr-title-and-description', `Title: ${pr.title}\n\n${clip(pr.body || '(no description)', 8000)}`));
 
-  if (issues.length) {
-    const text = issues
-      .map((i) => {
-        const comments = i.comments.length
-          ? `\n### Comments\n${i.comments.map((c) => `- @${c.author}: ${clip(c.body, 1000)}`).join('\n')}`
-          : '';
-        return `## ${i.repo}#${i.number}: ${i.title}\n${clip(i.body || '(no description)', 6000)}${comments}`;
-      })
-      .join('\n\n');
-    parts.push(fence('linked-issues', text));
-  } else {
-    parts.push('Linked issues: none found.');
-  }
+  parts.push(issuesSection(issues));
 
   if (guidelines.length) {
     parts.push(

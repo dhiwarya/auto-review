@@ -13,6 +13,11 @@ import type { OutcomeSync } from './sync.ts';
 const CORE_RESERVE = 300;
 const MAX_BACKOFF_MIN = 15;
 
+// GitHub states of a review that was submitted, as opposed to a pending draft.
+const SUBMITTED = ['APPROVED', 'COMMENTED', 'CHANGES_REQUESTED'];
+// How long after a review is posted before its PR can count as re-requested.
+const RECHECK_SETTLE_MS = 60_000;
+
 export interface PollerStatus {
   pausedUntil: string | null;
   pauseReason: string | null;
@@ -110,10 +115,14 @@ export class Poller {
         for (const pr of prs) {
           if (pr.draft || !pr.requestedReviewers.some((u) => u.toLowerCase() === me)) continue;
           requestedKeys.add(`${pr.repo}#${pr.number}`.toLowerCase());
-          if (!this.needsJob(pr)) continue;
+          const need = this.needsJob(pr);
+          if (!need) continue;
           try {
             const info = await getPr(this.gh, pr.repo, pr.number);
-            if (info.state === 'open' && !info.draft) this.enqueue(info, 'request');
+            if (info.state !== 'open' || info.draft) continue;
+            if (need === 'review') this.enqueue(info, 'request');
+            // Read fresh, so a list that hasn't caught up with the review just posted can't re-trigger it.
+            else if (info.headSha === pr.headSha && info.requestedReviewers.some((u) => u.toLowerCase() === me)) this.enqueueRecheck(info, 'request');
           } catch (err) {
             if (rateLimited(err)) throw err;
             console.error(`[poll] ${pr.repo}#${pr.number}: ${err instanceof Error ? err.message : err}`);
@@ -162,10 +171,60 @@ export class Poller {
     }
   }
 
-  // Decided from the database alone, so an unchanged PR costs no extra GitHub request.
-  private needsJob(pr: OpenPr): boolean {
-    const same = this.db.jobsForPr(pr.repo, pr.number).find((j) => j.head_sha === pr.headSha);
-    return !same || (same.state === 'cancelled' && same.skip_reason === 'request-removed');
+  // What a PR that requests you needs: a review of a commit not reviewed yet, or a re-check
+  // when the review was requested again without new commits. Decided from the database
+  // alone, so an unchanged PR costs no extra GitHub request.
+  private needsJob(pr: OpenPr): 'review' | 'recheck' | null {
+    const latest = this.db.jobsForPr(pr.repo, pr.number).find((j) => j.head_sha === pr.headSha);
+    if (!latest || (latest.state === 'cancelled' && latest.skip_reason === 'request-removed')) return 'review';
+    // Submitting a review takes you off the PR's requested reviewers, so being on it again
+    // after one was submitted means the author asked again. Drafts not yet submitted and
+    // dry runs leave the request in place, so they never count.
+    const answered = latest.state === 'done' && !latest.dry_run && SUBMITTED.includes(latest.review_state ?? '');
+    const settled = Date.now() - Date.parse(latest.finished_at ?? latest.updated_at) > RECHECK_SETTLE_MS;
+    return answered && settled ? 'recheck' : null;
+  }
+
+  // Re-checks the open findings on the PR's current commit, which was already reviewed.
+  enqueueRecheck(pr: PrInfo, source: Job['source']): Job {
+    const lastDone = this.db.jobsForPr(pr.repo, pr.number).find((j) => j.head_sha === pr.headSha && j.state === 'done');
+    const job = this.db.insertJob({
+      repo: pr.repo,
+      pr_number: pr.number,
+      pr_title: pr.title,
+      pr_url: pr.url,
+      author: pr.author,
+      head_sha: pr.headSha,
+      base_sha: pr.baseSha,
+      since_sha: pr.headSha,
+      kind: 'recheck',
+      mode: this.cfg.modeFor(pr.repo),
+      source,
+      dry_run: this.cfg.dryRun ? 1 : 0,
+      state: 'queued',
+      additions: pr.additions,
+      deletions: pr.deletions,
+      changed_files: pr.changedFiles,
+    });
+    const why = source === 'manual' ? 'Re-check requested from the dashboard' : 'Review requested again';
+    this.db.event(job.id, `${why} with no new commits since ${pr.headSha.slice(0, 7)}${lastDone ? ` (job ${lastDone.id})` : ''}: re-checking the open findings`);
+    bus.overviewChanged();
+    return job;
+  }
+
+  // The dashboard's "Re-check" on a finished review. Refused when the PR has moved on (that
+  // needs a normal follow-up review) or something is already queued for it.
+  async recheckFromDashboard(id: number): Promise<Job> {
+    const done = this.db.job(id);
+    if (!done || done.state !== 'done') throw new Error('Only finished reviews can be re-checked');
+    if (!this.cfg.isRepoAllowed(done.repo)) throw new Error('This repo is no longer in your repos list');
+    if (this.db.jobsForPr(done.repo, done.pr_number).some((j) => ACTIVE_STATES.includes(j.state))) {
+      throw new Error('This PR already has a review queued or running');
+    }
+    const pr = await getPr(this.gh, done.repo, done.pr_number);
+    if (pr.state !== 'open') throw new Error('This PR is no longer open');
+    if (pr.headSha !== done.head_sha) throw new Error(`The PR has new commits (${pr.headSha.slice(0, 7)}); review it from the queue instead`);
+    return this.enqueueRecheck(pr, 'manual');
   }
 
   // Creates the job for this PR's current head commit, if there isn't one yet.

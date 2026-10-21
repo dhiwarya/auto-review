@@ -14,6 +14,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   head_sha TEXT NOT NULL,
   base_sha TEXT NOT NULL DEFAULT '',
   since_sha TEXT,
+  kind TEXT NOT NULL DEFAULT 'review',
   mode TEXT NOT NULL,
   source TEXT NOT NULL DEFAULT 'request',
   dry_run INTEGER NOT NULL DEFAULT 0,
@@ -36,12 +37,19 @@ CREATE TABLE IF NOT EXISTS jobs (
   created_at TEXT NOT NULL,
   started_at TEXT,
   finished_at TEXT,
-  updated_at TEXT NOT NULL,
-  UNIQUE (repo, pr_number, head_sha)
+  updated_at TEXT NOT NULL
 );
+`;
+
+// Created after migrate(), because the unique index needs the kind column. One review per
+// commit; a commit can be re-checked any number of times.
+const JOB_INDEXES = `
 CREATE INDEX IF NOT EXISTS jobs_state ON jobs (state);
 CREATE INDEX IF NOT EXISTS jobs_pr ON jobs (repo, pr_number);
+CREATE UNIQUE INDEX IF NOT EXISTS jobs_one_review ON jobs (repo, pr_number, head_sha) WHERE kind = 'review';
+`;
 
+const OTHER_TABLES = `
 CREATE TABLE IF NOT EXISTS findings (
   id INTEGER PRIMARY KEY,
   job_id INTEGER NOT NULL REFERENCES jobs (id),
@@ -111,9 +119,34 @@ export class Db {
 
   constructor(dataPath: string) {
     this.sql = new DatabaseSync(path.join(dataPath, 'reviewer.sqlite'));
-    this.sql.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;');
+    // node:sqlite turns foreign keys on by default; they stay off until any rebuild is done.
+    this.sql.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = OFF;');
     this.sql.exec(SCHEMA);
+    this.dropReviewOnceConstraint();
+    this.sql.exec('PRAGMA foreign_keys = ON;');
+    this.sql.exec(OTHER_TABLES);
     this.migrate();
+    this.sql.exec(JOB_INDEXES);
+  }
+
+  // Databases from before re-checks allow only one job per commit. SQLite can't drop a
+  // table constraint, so the table is rebuilt without it (foreign keys are still off here).
+  private dropReviewOnceConstraint() {
+    const ddl = this.get<{ sql: string }>(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'jobs'`)?.sql ?? '';
+    const constraint = /,\s*UNIQUE \(repo, pr_number, head_sha\)/;
+    if (!constraint.test(ddl)) return;
+    const cols = this.all<{ name: string }>('PRAGMA table_info(jobs)').map((c) => c.name).join(', ');
+    this.sql.exec('BEGIN');
+    try {
+      this.sql.exec(ddl.replace(constraint, '').replace(/^CREATE TABLE (IF NOT EXISTS )?"?jobs"?/, 'CREATE TABLE jobs_rebuilt'));
+      this.sql.exec(`INSERT INTO jobs_rebuilt (${cols}) SELECT ${cols} FROM jobs`);
+      this.sql.exec('DROP TABLE jobs');
+      this.sql.exec('ALTER TABLE jobs_rebuilt RENAME TO jobs');
+      this.sql.exec('COMMIT');
+    } catch (err) {
+      this.sql.exec('ROLLBACK');
+      throw err;
+    }
   }
 
   // Columns added after the first release, for databases created before them.
@@ -130,6 +163,7 @@ export class Db {
       ['jobs', 'confidence', 'TEXT'],
       ['jobs', 'confidence_notes', 'TEXT'],
       ['jobs', 'approve_note', 'TEXT'],
+      ['jobs', 'kind', "TEXT NOT NULL DEFAULT 'review'"],
     ];
     for (const [table, column, type] of added) {
       const cols = this.all<{ name: string }>(`PRAGMA table_info(${table})`).map((c) => c.name);
@@ -155,13 +189,13 @@ export class Db {
     return this.get<Job>('SELECT * FROM jobs WHERE id = ?', id);
   }
 
-  insertJob(j: Pick<Job, 'repo' | 'pr_number' | 'pr_title' | 'pr_url' | 'author' | 'head_sha' | 'base_sha' | 'since_sha' | 'mode' | 'source' | 'dry_run' | 'state' | 'additions' | 'deletions' | 'changed_files'> & { skip_reason?: string | null }): Job {
+  insertJob(j: Pick<Job, 'repo' | 'pr_number' | 'pr_title' | 'pr_url' | 'author' | 'head_sha' | 'base_sha' | 'since_sha' | 'mode' | 'source' | 'dry_run' | 'state' | 'additions' | 'deletions' | 'changed_files'> & { kind?: Job['kind']; skip_reason?: string | null }): Job {
     const t = nowIso();
     const res = this.run(
-      `INSERT INTO jobs (repo, pr_number, pr_title, pr_url, author, head_sha, base_sha, since_sha, mode, source, dry_run, state,
+      `INSERT INTO jobs (repo, pr_number, pr_title, pr_url, author, head_sha, base_sha, since_sha, kind, mode, source, dry_run, state,
          skip_reason, additions, deletions, changed_files, created_at, updated_at, finished_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      j.repo, j.pr_number, j.pr_title, j.pr_url, j.author, j.head_sha, j.base_sha, j.since_sha, j.mode, j.source, j.dry_run, j.state,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      j.repo, j.pr_number, j.pr_title, j.pr_url, j.author, j.head_sha, j.base_sha, j.since_sha, j.kind ?? 'review', j.mode, j.source, j.dry_run, j.state,
       j.skip_reason ?? null, j.additions, j.deletions, j.changed_files, t, t, j.state === 'skipped' ? t : null,
     );
     const job = this.job(Number(res.lastInsertRowid))!;

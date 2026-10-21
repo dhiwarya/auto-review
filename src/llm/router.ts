@@ -2,7 +2,7 @@ import type { SettingsStore } from '../settings.ts';
 import type { Db } from '../db.ts';
 import type { ModelStatus, Provider, ProviderStatus } from '../types.ts';
 import { runClaude, runCodex, type AgentTask } from './agents.ts';
-import { ProviderUnavailable } from './run.ts';
+import { ContentRefused, ProviderUnavailable } from './run.ts';
 import { bus } from '../bus.ts';
 
 export class NoProviderAvailable extends Error {
@@ -20,7 +20,8 @@ const modelKey = (p: Provider, model: string | null) => `${p}/${model ?? 'defaul
 // Runs every pass on the chosen provider's models in order (e.g. Sol 6.1, then Sol 6), and
 // on the other provider's models when none of them can take work and falling back is on. A model that hits a
 // usage limit, isn't available or is overloaded is paused on its own; "not signed in"
-// pauses the whole provider. Pauses are remembered across restarts.
+// pauses the whole provider. Pauses are remembered across restarts. A model whose safety
+// filter declines the content isn't paused: the run just moves on down the same chain.
 export class Router {
   private readonly db: Db;
   private readonly cfg: SettingsStore;
@@ -126,6 +127,11 @@ export class Router {
             turns: null, tool_calls: null, input_tokens: null, cached_input_tokens: null, output_tokens: null, cost_usd: null,
           });
           if (task.signal?.aborted) throw err;
+          if (err instanceof ContentRefused) {
+            this.db.event(jobId, `${provider} ${model ?? '(default model)'} declined the ${purpose} pass (flagged by its safety filter); trying the next model`, 'warn');
+            lastErr = err;
+            continue;
+          }
           if (!(err instanceof ProviderUnavailable)) throw err; // a real failure of this run; job retries handle it
           this.block(provider, model, err);
           this.db.event(jobId, `${provider} ${model ?? '(default model)'} unavailable (${err.reason}); trying the next model`, 'warn');
@@ -139,6 +145,7 @@ export class Router {
     if (retryAts.every((d) => d !== null)) {
       throw new NoProviderAvailable(new Date(Math.min(...retryAts.map((d) => d!.getTime()))));
     }
+    if (lastErr instanceof ContentRefused) throw new ContentRefused(`Every available model declined the ${purpose} pass; the last one was ${lastErr.message}`);
     throw lastErr ?? new Error('no model ran');
   }
 }

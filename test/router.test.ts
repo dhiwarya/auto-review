@@ -5,6 +5,7 @@ import path from 'node:path';
 import { after, describe, it } from 'node:test';
 import { Db } from '../src/db.ts';
 import { NoProviderAvailable, Router } from '../src/llm/router.ts';
+import { classifyFailure, ContentRefused, ProviderUnavailable } from '../src/llm/run.ts';
 import { SettingsStore } from '../src/settings.ts';
 
 // Stand-in CLIs: each reads how to behave for the requested model from a file next to it.
@@ -16,6 +17,7 @@ cat > /dev/null
 case "$b" in
   model) echo '{"type":"result","is_error":true,"subtype":"error","result":"The model '"$model"' is not available on your plan"}'; exit 1;;
   quota) echo '{"type":"result","is_error":true,"subtype":"error","result":"Claude usage limit reached"}'; exit 1;;
+  refused) echo '{"type":"result","is_error":true,"subtype":"success","result":"API Error: Claude Code is unable to respond to this request, which appears to violate our Usage Policy"}'; exit 1;;
   *) echo '{"type":"result","is_error":false,"subtype":"success","result":"","structured_output":{"ran":"'"$model"'"}}';;
 esac
 `;
@@ -28,6 +30,7 @@ cat > /dev/null
 case "$b" in
   auth) echo "Error: Not logged in" >&2; exit 1;;
   quota) echo "You've hit your usage limit" >&2; exit 1;;
+  flagged) echo '{"type":"turn.failed","error":{"message":"This content was flagged for possible cybersecurity risk. If this seems wrong, try rephrasing your request. Otherwise, confirm that the access_programs.cyber parameter is set to the appropriate tier, and note that some cybersecurity requests are still limited, even when Daybreak is on."}}'; exit 1;;
   *) printf '{"ran":"%s"}' "$model" > "$out";;
 esac
 `;
@@ -121,6 +124,28 @@ describe('Router model fallback', { skip: process.platform === 'win32' && 'uses 
     assert.equal(reloaded.models.codex.model, 'gpt-6.1-sol', 'other settings are kept');
   });
 
+  it('passes content a safety filter declines down the whole chain, pausing nothing', async () => {
+    behave('codex', 'gpt-6.1-sol', 'flagged');
+    behave('codex', 'gpt-6-sol', 'flagged');
+    const res = await router.run(job.id, 'security', task);
+    assert.equal(res.provider, 'claude');
+    assert.equal(res.model, 'claude-opus-5-5');
+    const codex = router.status().find((s) => s.provider === 'codex')!;
+    assert.equal(codex.blocked_until, null, 'a refusal is about the content, so Codex stays available');
+    assert.ok(codex.models.every((m) => m.blocked_until === null));
+
+    behave('claude', 'claude-opus-5-5', 'refused');
+    assert.equal((await router.run(job.id, 'security', task)).model, 'claude-opus-4-8');
+
+    behave('claude', 'claude-opus-4-8', 'refused');
+    await assert.rejects(router.run(job.id, 'security', task), ContentRefused);
+    behave('codex', 'gpt-6.1-sol', 'ok');
+    assert.equal((await router.run(job.id, 'main', task)).model, 'gpt-6.1-sol', 'the next run starts at the top again');
+    behave('codex', 'gpt-6-sol', 'ok');
+    behave('claude', 'claude-opus-5-5', 'ok');
+    behave('claude', 'claude-opus-4-8', 'ok');
+  });
+
   it('with falling back turned off, never touches the other provider', async () => {
     const all = cfg.all;
     assert.ok(cfg.update({ ...all, models: { ...all.models, fallbackToOther: false } }).ok);
@@ -129,6 +154,19 @@ describe('Router model fallback', { skip: process.platform === 'win32' && 'uses 
     const claudeRunsBefore = db.runs(job.id).filter((r) => r.provider === 'claude').length;
     await assert.rejects(router.run(job.id, 'main', task), NoProviderAvailable);
     assert.equal(db.runs(job.id).filter((r) => r.provider === 'claude').length, claudeRunsBefore);
+  });
+});
+
+describe('Classifying a failed run', () => {
+  it("tells a safety-filter refusal from a usage limit, though OpenAI's says requests are 'still limited'", () => {
+    const flagged =
+      '{"type":"turn.failed","error":{"message":"This content was flagged for possible cybersecurity risk. If this seems wrong, try rephrasing your request. ' +
+      'Otherwise, confirm that the access_programs.cyber parameter is set to the appropriate tier, and note that some cybersecurity requests are still limited, even when Daybreak is on."}}';
+    assert.ok(classifyFailure(flagged) instanceof ContentRefused);
+    assert.ok(classifyFailure('API Error: Claude Code is unable to respond to this request, which appears to violate our Usage Policy') instanceof ContentRefused);
+    const quota = classifyFailure("You've hit your usage limit");
+    assert.ok(quota instanceof ProviderUnavailable && quota.reason === 'quota');
+    assert.equal(classifyFailure('TypeError: x is undefined'), null);
   });
 });
 

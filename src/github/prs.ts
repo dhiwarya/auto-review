@@ -77,6 +77,29 @@ export async function listPrFiles(gh: GitHub, repo: string, number: number): Pro
   }));
 }
 
+export interface PrComment {
+  author: string;
+  body: string;
+  createdAt: string;
+  // The review comment this one answers, for replies in a review thread.
+  inReplyTo: number | null;
+}
+
+// What people said on the PR: every reply in a review thread, plus conversation comments
+// made since `since`. Used to re-check findings without new commits.
+export async function listDiscussion(gh: GitHub, repo: string, number: number, since: string): Promise<PrComment[]> {
+  const [threads, conversation] = await Promise.all([
+    gh.octokit.paginate(gh.octokit.rest.pulls.listReviewComments, { ...splitRepo(repo), pull_number: number, per_page: 100 }),
+    gh.octokit.paginate(gh.octokit.rest.issues.listComments, { ...splitRepo(repo), issue_number: number, since, per_page: 100 }),
+  ]);
+  return [
+    ...threads
+      .filter((c) => c.in_reply_to_id)
+      .map((c) => ({ author: c.user?.login ?? 'unknown', body: c.body, createdAt: c.created_at, inReplyTo: c.in_reply_to_id ?? null })),
+    ...conversation.map((c) => ({ author: c.user?.login ?? 'unknown', body: c.body ?? '', createdAt: c.created_at, inReplyTo: null })),
+  ];
+}
+
 // Files changed between the last reviewed commit and the new head. Returns null when the
 // branch was rebased or force-pushed, in which case the caller falls back to a full review.
 export async function compareCommits(gh: GitHub, repo: string, since: string, head: string): Promise<PrFile[] | null> {

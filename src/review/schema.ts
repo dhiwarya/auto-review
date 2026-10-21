@@ -75,6 +75,29 @@ export const verifySchema = {
   },
 };
 
+export const recheckSchema = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['summary', 'verdicts', 'review_confidence'],
+  properties: {
+    summary: str,
+    verdicts: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['id', 'status', 'reason'],
+        properties: {
+          id: { type: 'integer' },
+          status: enumOf(['open', 'resolved']),
+          reason: str,
+        },
+      },
+    },
+    review_confidence: reviewSchema.properties.review_confidence,
+  },
+};
+
 // Runtime checks of what actually came back.
 
 const severity = z.enum(['blocker', 'major', 'minor', 'nit']);
@@ -119,3 +142,10 @@ export const VerifyOut = z.object({
   ),
 });
 export type VerifyOut = z.infer<typeof VerifyOut>;
+
+export const RecheckOut = z.object({
+  summary: z.string(),
+  verdicts: z.array(z.object({ id: z.number().int(), status: z.enum(['open', 'resolved']), reason: z.string() })),
+  review_confidence: ReviewOut.shape.review_confidence,
+});
+export type RecheckOut = z.infer<typeof RecheckOut>;

@@ -58,7 +58,7 @@ export class Worker {
       return `Paused between ${this.cfg.schedule.pauseBetween!.start} and ${this.cfg.schedule.pauseBetween!.end}`;
     }
     const hourAgo = new Date(Date.now() - 3600_000).toISOString();
-    const started = this.db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM runs WHERE purpose = 'main' AND created_at >= ?`, hourAgo)?.n ?? 0;
+    const started = this.db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM runs WHERE purpose IN ('main', 'recheck') AND created_at >= ?`, hourAgo)?.n ?? 0;
     if (started >= this.cfg.schedule.maxReviewsPerHour) return `Hourly limit reached (${this.cfg.schedule.maxReviewsPerHour} reviews per hour)`;
     return null;
   }

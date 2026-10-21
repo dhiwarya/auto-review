@@ -6,6 +6,8 @@ A personal review agent that runs on your own machine. When someone requests you
 
 One provider does the whole review: **Codex** by default (Sol 6.1, then Sol 6), with **Claude** taking over only if Codex runs out (Opus 5.5, then Opus 4.8). You can switch providers, or turn the fallback off, on the dashboard's Settings page.
 
+Security reviews can trip a provider's safety filter (OpenAI may flag one as "possible cybersecurity risk"). That run then goes to the next model in the same order, ending with Claude if the fallback is on. Nothing is paused, since the refusal is about that PR, not the model. The security instructions say plainly that this is a defensive review of the team's own code, and never ask for exploit code or payloads.
+
 | Pass | Looks for |
 | --- | --- |
 | Code + requirements | Bugs, edge cases, error handling, concurrency, weak tests, breaking changes. It also compares the code with the linked GitHub issues: requirements that are **missing**, implemented **differently** from the issue, or **inconsistent** with the PR description. |
@@ -28,11 +30,24 @@ Severity scale: **blocker**, **major**, **minor**, **nit**.
 review requested ─► queued ─► reviewing ─► posted ─► approved, or feedback
                                   │
        new commits pushed ────────┤ (follow-up review of only the new commits; fixed findings are listed)
+       re-requested, no commits ──┤ (re-check of the findings still open; see below)
        request removed/PR closed ─┤ cancelled
        both models at their limit ┤ waiting until the limit resets
        you have a pending review  ┤ waiting until you submit or discard it
        3 failed attempts ─────────┴ failed (shown on the dashboard)
 ```
+
+### Reviewing again
+
+Submitting a review takes you off the PR's requested reviewers, as on GitHub for anyone. To get another review, the author **re-requests your review**:
+
+- **With new commits:** a follow-up review of only the commits since the last one. It lists the earlier findings the new code fixes, and doesn't raise the ones still open again.
+- **Without new commits:** a **re-check**. Nothing new is raised on code that was already reviewed. Each finding still open from earlier reviews is read again against the code and what was said on the PR since (replies in its thread, and the PR conversation), and stays open or is resolved. A reply saying "fixed" or "intentional" only resolves a finding when the code confirms it. The review then:
+  - **requests changes** while a blocker or major is still open,
+  - **comments** when only minors or nits are,
+  - **approves** when everything is resolved and the rules in [Confidence and approval](#confidence-and-approval) allow it.
+
+  In draft mode it prepares the draft and the dashboard says which to choose when you submit it. A draft you haven't submitted, a discarded draft and a dry run leave you on the requested reviewers, so they never trigger a re-check; use **Re-check** on the review's page instead.
 
 A PR carries one of these labels at a time. The names are set in Settings:
 
@@ -58,7 +73,7 @@ Every review gets a confidence level: how sure it is that nothing blocks the PR.
 | Low | The code doesn't match the linked issue, or the PR tried to get a credential out of the reviewer |
 | Either | A review pass rates its own confidence lower, saying what it couldn't check |
 
-A published review **approves the PR** when no blocker is open (in this review or an earlier one on the PR) and the confidence is at least the minimum set in Settings (high by default). It never approves a draft (you decide when you submit it), a draft PR, your own PR, a PR with commits newer than the review, or one where you requested changes yourself. Otherwise it posts a comment review, and the dashboard says why it didn't approve. An approval counts toward branch protection, so the PR may become mergeable.
+A published review **approves the PR** when no blocker is open (in this review or an earlier one on the PR) and the confidence is at least the minimum set in Settings (high by default). It never approves a draft (you decide when you submit it), a draft PR, your own PR, a PR with commits newer than the review, or one where you requested changes yourself. A change request the app published from a re-check doesn't count as yours: approving replaces it. Otherwise it posts a comment review, and the dashboard says why it didn't approve. An approval counts toward branch protection, so the PR may become mergeable.
 
 ## Safety model
 
@@ -67,7 +82,7 @@ A published review **approves the PR** when no blocker is open (in this review o
 - **The agents never get your GitHub token.** They get an allowlisted environment, and their only output is JSON. The app does all GitHub writes itself.
 - **Nothing posted can carry a credential.** Every finding, summary, question and note is checked for secret formats (GitHub, Anthropic, OpenAI, AWS, Slack, private keys, JWTs). A secret the PR doesn't add itself is redacted and lowers the confidence to low. Right before posting, the whole review is also checked against the app's own credentials, word for word: the GitHub token, the Claude token and the Codex and Claude login files. A match stops the post and fails the review.
 - **Throwaway checkouts.** Each review gets its own worktree of the PR head in a temp folder, made from the local repo copy, with symlinks disabled. It's deleted afterwards. Your GitHub token is passed to git through the environment and never written into the local copy.
-- **Approves only under strict rules, never requests changes.** Draft mode posts a pending review. Publish mode approves when the rules in [Confidence and approval](#confidence-and-approval) allow it, and posts a comment review otherwise. Text in a PR can't raise the confidence: the hard rules are checked by the app, not the model.
+- **Approves only under strict rules, and requests changes only from a re-check.** Draft mode posts a pending review. Publish mode approves when the rules in [Confidence and approval](#confidence-and-approval) allow it, requests changes when a [re-check](#reviewing-again) finds a blocker or major still open, and posts a comment review otherwise. Text in a PR can't raise the confidence: the hard rules are checked by the app, not the model.
 - **Local dashboard.** It listens on `127.0.0.1` only, rejects foreign `Host` headers (DNS rebinding), and requires a custom header on every write (CSRF).
 - **Subscription terms.** It drives the official `claude` and `codex` CLIs with your own logins, for your own review queue. Don't share one instance with teammates. Each person should run their own.
 - **Company code.** These reviews send your repos' code to your personal Claude and ChatGPT accounts. Check that your employer allows it, and turn off model training in both accounts.

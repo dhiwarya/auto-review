@@ -114,6 +114,14 @@ export async function startServer(deps: Deps) {
     return { ok: true };
   });
 
+  app.post<{ Params: { id: string } }>('/api/jobs/:id/recheck', async (req, reply) => {
+    try {
+      return await poller.recheckFromDashboard(Number(req.params.id));
+    } catch (err) {
+      return reply.code(409).send({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
   app.post<{ Params: { id: string } }>('/api/jobs/:id/cancel', async (req) => {
     worker.cancel(Number(req.params.id), 'cancelled from the dashboard');
     return { ok: true };

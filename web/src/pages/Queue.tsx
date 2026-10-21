@@ -26,7 +26,7 @@ function ActiveCard({ job }: { job: Job }) {
       <div className="small muted">
         {job.step ?? 'Waiting to start'}
         {job.next_attempt_at && job.state !== 'running' && ` · next try ${clockTime(job.next_attempt_at)}`}
-        {job.since_sha && ' · follow-up review'}
+        {job.kind === 'recheck' ? ' · re-check, no new commits' : job.since_sha && ' · follow-up review'}
       </div>
     </a>
   );

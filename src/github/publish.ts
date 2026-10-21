@@ -25,7 +25,7 @@ const FINDING_MARKER = /<!-- ai-finding:(\d+) -->/;
 export const SIGNATURE = '<sub>Auto Reviewer</sub>';
 
 // null posts a pending draft that only you can see until you submit it.
-export type ReviewEvent = 'COMMENT' | 'APPROVE' | null;
+export type ReviewEvent = 'COMMENT' | 'APPROVE' | 'REQUEST_CHANGES' | null;
 
 export async function postReview(
   gh: GitHub,
@@ -79,14 +79,19 @@ function insertBeforeSignature(body: string, section: string): string {
   return at < 0 ? `${body}\n\n${section}` : `${body.slice(0, at)}${section}\n\n${body.slice(at)}`;
 }
 
+export interface Verdict {
+  state: 'APPROVED' | 'CHANGES_REQUESTED';
+  reviewId: number;
+}
+
 // Your standing verdict on the PR from your own reviews: the latest approval or change
 // request counts, comments don't. null when you have neither.
-export async function myVerdict(gh: GitHub, repo: string, number: number): Promise<'APPROVED' | 'CHANGES_REQUESTED' | null> {
+export async function myVerdict(gh: GitHub, repo: string, number: number): Promise<Verdict | null> {
   const reviews = await gh.octokit.paginate(gh.octokit.rest.pulls.listReviews, { ...splitRepo(repo), pull_number: number, per_page: 100 });
-  let verdict: 'APPROVED' | 'CHANGES_REQUESTED' | null = null;
+  let verdict: Verdict | null = null;
   for (const r of reviews) {
     if (r.user?.login?.toLowerCase() !== gh.me.toLowerCase()) continue;
-    if (r.state === 'APPROVED' || r.state === 'CHANGES_REQUESTED') verdict = r.state;
+    if (r.state === 'APPROVED' || r.state === 'CHANGES_REQUESTED') verdict = { state: r.state, reviewId: r.id };
     if (r.state === 'DISMISSED') verdict = null;
   }
   return verdict;
