@@ -1,5 +1,4 @@
 import { errorText, httpStatus, splitRepo, type GitHub } from './client.ts';
-import type { ReviewMode } from '../types.ts';
 
 export interface InlineComment {
   findingId: number;
@@ -22,12 +21,18 @@ export class PendingReviewExists extends Error {}
 export const findingMarker = (id: number) => `<!-- ai-finding:${id} -->`;
 const FINDING_MARKER = /<!-- ai-finding:(\d+) -->/;
 
+// The last line of every comment the app writes.
+export const SIGNATURE = '<sub>Auto Reviewer</sub>';
+
+// null posts a pending draft that only you can see until you submit it.
+export type ReviewEvent = 'COMMENT' | 'APPROVE' | null;
+
 export async function postReview(
   gh: GitHub,
   repo: string,
   number: number,
   headSha: string,
-  mode: ReviewMode,
+  event: ReviewEvent,
   body: string,
   comments: InlineComment[],
 ): Promise<PostedReview & { droppedInline: boolean }> {
@@ -37,8 +42,7 @@ export async function postReview(
       pull_number: number,
       commit_id: headSha,
       body: reviewBody,
-      // No event = a pending review that only you can see until you submit it.
-      ...(mode === 'publish' ? { event: 'COMMENT' as const } : {}),
+      ...(event ? { event } : {}),
       comments: withComments.map((c) => ({ path: c.path, line: c.line, side: 'RIGHT' as const, body: c.body })),
     });
 
@@ -52,8 +56,8 @@ export async function postReview(
     // A line GitHub won't accept fails the whole review. Retry once with everything in the body.
     if (httpStatus(err) === 422 && comments.length) {
       droppedInline = true;
-      const moved = comments.map((c) => `**\`${c.path}:${c.line}\`**\n\n${c.body}`).join('\n\n---\n\n');
-      res = await create([], `${body}\n\n### Findings on changed lines\n\n${moved}`);
+      const moved = comments.map((c) => `**\`${c.path}:${c.line}\`**\n\n${c.body.replace(SIGNATURE, '').trim()}`).join('\n\n---\n\n');
+      res = await create([], insertBeforeSignature(body, `**Findings on changed lines**\n\n${moved}`));
     } else {
       throw err;
     }
@@ -68,6 +72,24 @@ export async function postReview(
     }
   }
   return { id: review.id, url: review.html_url, state: review.state, commentIds, droppedInline };
+}
+
+function insertBeforeSignature(body: string, section: string): string {
+  const at = body.lastIndexOf(SIGNATURE);
+  return at < 0 ? `${body}\n\n${section}` : `${body.slice(0, at)}${section}\n\n${body.slice(at)}`;
+}
+
+// Your standing verdict on the PR from your own reviews: the latest approval or change
+// request counts, comments don't. null when you have neither.
+export async function myVerdict(gh: GitHub, repo: string, number: number): Promise<'APPROVED' | 'CHANGES_REQUESTED' | null> {
+  const reviews = await gh.octokit.paginate(gh.octokit.rest.pulls.listReviews, { ...splitRepo(repo), pull_number: number, per_page: 100 });
+  let verdict: 'APPROVED' | 'CHANGES_REQUESTED' | null = null;
+  for (const r of reviews) {
+    if (r.user?.login?.toLowerCase() !== gh.me.toLowerCase()) continue;
+    if (r.state === 'APPROVED' || r.state === 'CHANGES_REQUESTED') verdict = r.state;
+    if (r.state === 'DISMISSED') verdict = null;
+  }
+  return verdict;
 }
 
 export async function listReviewComments(gh: GitHub, repo: string, number: number, reviewId: number) {

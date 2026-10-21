@@ -29,12 +29,12 @@ describe('SettingsStore', () => {
 
   it('saves to the database and applies changes straight away', () => {
     const cfg = new SettingsStore(db);
-    const res = cfg.update({ ...cfg.all, repos: { allow: ['acme/*'], deny: ['acme/secret'] }, labels: { prefix: 'bot', blockerLabelInDraft: false } });
+    const res = cfg.update({ ...cfg.all, repos: { allow: ['acme/*'], deny: ['acme/secret'] }, labels: { reviewing: 'bot: reviewing', feedback: 'bot: feedback', approved: 'bot: ok' } });
     assert.ok(res.ok);
     assert.equal(cfg.isRepoAllowed('acme/api'), true);
     assert.equal(cfg.isRepoAllowed('ACME/API'), true, 'case-insensitive');
     assert.equal(cfg.isRepoAllowed('acme/secret'), false, 'deny wins');
-    assert.equal(cfg.labelName('done'), 'bot:done');
+    assert.equal(cfg.labels.approved, 'bot: ok');
     assert.deepEqual(new SettingsStore(db).repos.allow, ['acme/*'], 'persists across restarts');
   });
 
@@ -47,6 +47,26 @@ describe('SettingsStore', () => {
     const paths = res.issues.map((i) => i.path);
     assert.ok(paths.includes('repos.allow.0'));
     assert.ok(paths.includes('schedule.pollIntervalSec'));
+    assert.deepEqual(cfg.repos.allow, ['acme/api']);
+  });
+
+  it('needs three different label names, ignoring case as GitHub does', () => {
+    const cfg = new SettingsStore(db);
+    const res = cfg.update({ ...cfg.all, labels: { reviewing: 'dh: on review', feedback: 'DH: On Review', approved: ' ' } });
+    assert.equal(res.ok, false);
+    if (res.ok) return;
+    assert.deepEqual(
+      res.issues.map((i) => i.path).sort(),
+      ['labels.approved', 'labels.feedback'],
+    );
+    assert.equal(cfg.labels.reviewing, 'dh: on review', 'defaults stay in place');
+    assert.deepEqual(cfg.approval, { enabled: true, minConfidence: 'high' });
+  });
+
+  it('drops settings that no longer exist, such as the old label prefix', () => {
+    db.setKv('settings', JSON.stringify({ repos: { allow: ['acme/api'] }, labels: { prefix: 'ai-review', blockerLabelInDraft: true } }));
+    const cfg = new SettingsStore(db);
+    assert.deepEqual(cfg.labels, { reviewing: 'dh: on review', feedback: 'dh: feedback', approved: 'dh: approved' });
     assert.deepEqual(cfg.repos.allow, ['acme/api']);
   });
 

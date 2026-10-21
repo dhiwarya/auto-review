@@ -126,6 +126,10 @@ export class Db {
       ['runs', 'cached_input_tokens', 'INTEGER'],
       ['runs', 'output_tokens', 'INTEGER'],
       ['runs', 'cost_usd', 'REAL'],
+      ['findings', 'posted_body', 'TEXT'],
+      ['jobs', 'confidence', 'TEXT'],
+      ['jobs', 'confidence_notes', 'TEXT'],
+      ['jobs', 'approve_note', 'TEXT'],
     ];
     for (const [table, column, type] of added) {
       const cols = this.all<{ name: string }>(`PRAGMA table_info(${table})`).map((c) => c.name);
@@ -198,7 +202,7 @@ export class Db {
 
   // ---- findings, runs, events
 
-  insertFinding(f: Omit<Finding, 'id' | 'created_at' | 'resolved_by_job'>): Finding {
+  insertFinding(f: Omit<Finding, 'id' | 'created_at' | 'resolved_by_job' | 'posted_body'>): Finding {
     const res = this.run(
       `INSERT INTO findings (job_id, pass, model, model_id, category, severity, original_severity, confidence, file, line, title,
          evidence, problem, suggestion, verification, verified_by, verify_reason, status, drop_reason, comment_id, outcome, created_at)

@@ -51,6 +51,28 @@ function FindingCard({ f }: { f: Finding }) {
   );
 }
 
+const CONFIDENCE_LABEL = { high: 'High', medium: 'Medium', low: 'Low' } as const;
+
+// The review's confidence, what lowered it, and whether it approved the PR.
+function Verdict({ job }: { job: Job }) {
+  if (!job.confidence) return null;
+  const notes = job.confidence_notes?.split('\n').filter(Boolean) ?? [];
+  let outcome: string | null = null;
+  if (job.review_state === 'APPROVED') outcome = 'Approved';
+  else if (job.dry_run) outcome = null;
+  else if (job.approve_note) outcome = `Not approved: ${job.approve_note}`;
+  else if (job.mode === 'draft' && job.review_state === 'PENDING') outcome = 'No blockers: you can approve it when you submit the draft';
+  return (
+    <div className="small meta-line">
+      <span>
+        Confidence <strong>{CONFIDENCE_LABEL[job.confidence]}</strong>
+      </span>
+      {outcome && <span>{outcome}</span>}
+      {notes.length > 0 && <span className="muted">{notes.join(' · ')}</span>}
+    </div>
+  );
+}
+
 // Confirms and posts a dry-run review to the PR.
 function PostPanel({ job, onClose }: { job: Job; onClose: () => void }) {
   const [preview, setPreview] = useState<PostPreview | null>(null);
@@ -80,9 +102,7 @@ function PostPanel({ job, onClose }: { job: Job; onClose: () => void }) {
   };
 
   const moved = preview && preview.currentSha !== preview.reviewedSha;
-  const labels = preview
-    ? [preview.doneLabel, ...(preview.blockerLabel && (mode === 'publish' || preview.blockerLabelInDraft) ? [preview.blockerLabel] : [])]
-    : [];
+  const approves = mode === 'publish' && preview?.approveNote === null;
 
   return (
     <div className="post-panel">
@@ -103,16 +123,21 @@ function PostPanel({ job, onClose }: { job: Job; onClose: () => void }) {
             <label className={`post-mode ${mode === 'publish' ? 'active' : ''}`}>
               <input type="radio" name="mode" checked={mode === 'publish'} onChange={() => setMode('publish')} />
               <span>
-                <strong>Publish</strong>
-                <span className="small muted block">Posted now as a comment review under your name, visible to the author and everyone on the repo.</span>
+                <strong>{preview.approveNote === null ? 'Publish and approve' : 'Publish'}</strong>
+                <span className="small muted block">
+                  {preview.approveNote === null
+                    ? 'Posted now under your name and approves the PR. Visible to the author and everyone on the repo.'
+                    : 'Posted now as a comment review under your name, visible to the author and everyone on the repo.'}
+                </span>
               </span>
             </label>
           </div>
           <div className="small">
             Posts {preview.inline} inline comment{preview.inline === 1 ? '' : 's'}
-            {preview.inSummary ? ` and ${preview.inSummary} finding${preview.inSummary === 1 ? '' : 's'} in the summary` : ''}, and adds the label
-            {labels.length > 1 ? 's' : ''} {labels.map((l) => <code key={l}>{l} </code>)}
+            {preview.inSummary ? ` and ${preview.inSummary} finding${preview.inSummary === 1 ? '' : 's'} in the summary` : ''}, and sets the label{' '}
+            <code>{preview.labels[mode]}</code>
           </div>
+          {mode === 'publish' && preview.approveNote && <div className="small muted">Won't approve: {preview.approveNote}.</div>}
           {moved && (
             <div className="small warn-text">
               The PR has new commits since this review ({shortSha(preview.reviewedSha)} → {shortSha(preview.currentSha)}). Comments go on the
@@ -128,7 +153,7 @@ function PostPanel({ job, onClose }: { job: Job; onClose: () => void }) {
         </button>
         {preview && (
           <button className="btn" onClick={post} disabled={posting}>
-            {posting ? 'Posting…' : mode === 'draft' ? 'Post draft' : 'Publish review'}
+            {posting ? 'Posting…' : mode === 'draft' ? 'Post draft' : approves ? 'Publish and approve' : 'Publish review'}
           </button>
         )}
       </div>
@@ -219,6 +244,8 @@ export function JobView({ id }: { id: number }) {
             {usage.output !== null && <span>{compact(usage.output)} tokens out</span>}
           </div>
         )}
+
+        <Verdict job={job} />
 
         {active && (
           <div className="job-progress">

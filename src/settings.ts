@@ -102,6 +102,7 @@ export class SettingsStore {
   get schedule() { return this.data.schedule; }
   get limits() { return this.data.limits; }
   get labels() { return this.data.labels; }
+  get approval() { return this.data.approval; }
   get keepCheckouts() { return this.data.keepCheckouts; }
 
   // ---- helpers
@@ -121,10 +122,6 @@ export class SettingsStore {
   modeFor(repo: string): ReviewMode {
     const hit = this.data.repoModes.find((o) => picomatch.isMatch(repo.toLowerCase(), o.repo.toLowerCase()));
     return hit ? hit.mode : this.data.defaultMode;
-  }
-
-  labelName(kind: 'running' | 'done' | 'blocker' | 'failed'): string {
-    return `${this.data.labels.prefix}:${kind}`;
   }
 
   modelChain(p: Provider): (string | null)[] {

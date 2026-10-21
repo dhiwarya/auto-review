@@ -54,6 +54,11 @@ export interface Job {
   review_state: string | null;
   review_body: string | null;
   spec_status: SpecStatus | null;
+  // How sure the review is that nothing blocks the PR, and what lowered it (one per line).
+  confidence: Confidence | null;
+  confidence_notes: string | null;
+  // Why the review didn't approve the PR; null when it did, or when it could have.
+  approve_note: string | null;
   additions: number;
   deletions: number;
   changed_files: number;
@@ -90,6 +95,8 @@ export interface Finding {
   comment_id: number | null;
   outcome: Outcome | null;
   resolved_by_job: number | null;
+  // The inline comment exactly as posted, to tell later whether you edited it.
+  posted_body: string | null;
   created_at: string;
 }
 
@@ -199,7 +206,7 @@ export interface PostPreview {
   reviewedSha: string;
   currentSha: string;
   defaultMode: ReviewMode;
-  doneLabel: string;
-  blockerLabel: string | null;
-  blockerLabelInDraft: boolean;
+  // Publishing approves the PR when approveNote is null.
+  approveNote: string | null;
+  labels: Record<ReviewMode, string>;
 }

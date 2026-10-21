@@ -17,6 +17,7 @@ export interface PrInfo {
   deletions: number;
   changedFiles: number;
   requestedReviewers: string[];
+  labels: string[];
 }
 
 export interface PrFile {
@@ -56,6 +57,7 @@ export async function getPr(gh: GitHub, repo: string, number: number): Promise<P
     deletions: data.deletions,
     changedFiles: data.changed_files,
     requestedReviewers: (data.requested_reviewers ?? []).map((u) => u.login),
+    labels: (data.labels ?? []).map((l) => (typeof l === 'string' ? l : (l.name ?? ''))).filter(Boolean),
   };
 }
 

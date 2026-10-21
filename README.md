@@ -25,23 +25,40 @@ Severity scale: **blocker**, **major**, **minor**, **nit**.
 ## Lifecycle
 
 ```
-review requested ─► queued ─► reviewing ─► draft review posted ─► ai-review:done
+review requested ─► queued ─► reviewing ─► posted ─► approved, or feedback
                                   │
        new commits pushed ────────┤ (follow-up review of only the new commits; fixed findings are listed)
        request removed/PR closed ─┤ cancelled
        both models at their limit ┤ waiting until the limit resets
        you have a pending review  ┤ waiting until you submit or discard it
-       3 failed attempts ─────────┴ ai-review:failed
+       3 failed attempts ─────────┴ failed (shown on the dashboard)
 ```
+
+A PR carries one of these labels at a time. The names are set in Settings:
 
 | Label | Meaning |
 | --- | --- |
-| `ai-review:running` | Review in progress |
-| `ai-review:done` | Review finished. In draft mode, the draft is waiting for you. |
-| `ai-review:blocker` | At least one blocker. In draft mode this label is added only after you submit with a blocker kept. |
-| `ai-review:failed` | Gave up after retries |
+| `dh: on review` | Review in progress. In draft mode it stays until you submit the draft. |
+| `dh: feedback` | Reviewed without approving. |
+| `dh: approved` | Approved for you, or you submitted your draft as an approval. |
 
-Adding labels needs triage access. If the token can't add them, the review still works, and the summary carries a hidden marker instead.
+Adding labels needs triage access. If the token can't add them, the review still works, and the summary carries a hidden marker instead. Labels from earlier versions (`ai-review:*`) are taken off a PR when it gets a new one.
+
+## Comments
+
+Plain markdown with no emoji and no model details. Inline comments read `**Blocker (bug):** title`, then the problem and a suggestion. The summary opens with the counts (`**1 blocker, 2 minor**`, or `**No issues found.**`), then the overall assessment, requirements, findings not tied to a line, questions and what was fixed since the last review, each only when there is something to say. Every comment is signed `Auto Reviewer`. The model, confidence and double-check details stay on the dashboard.
+
+## Confidence and approval
+
+Every review gets a confidence level: how sure it is that nothing blocks the PR. It starts at high and drops for anything that leaves doubt:
+
+| Lowers it to | When |
+| --- | --- |
+| Medium | A major finding is open, there are questions for the author, the code only partly matches the linked issue, the change is large, or the diff was too long to send in full |
+| Low | The code doesn't match the linked issue, or the PR tried to get a credential out of the reviewer |
+| Either | A review pass rates its own confidence lower, saying what it couldn't check |
+
+A published review **approves the PR** when no blocker is open (in this review or an earlier one on the PR) and the confidence is at least the minimum set in Settings (high by default). It never approves a draft (you decide when you submit it), a draft PR, your own PR, a PR with commits newer than the review, or one where you requested changes yourself. Otherwise it posts a comment review, and the dashboard says why it didn't approve. An approval counts toward branch protection, so the PR may become mergeable.
 
 ## Safety model
 
@@ -49,7 +66,7 @@ Adding labels needs triage access. If the token can't add them, the review still
 - **Read-only agents.** Claude runs as `claude -p --restricted --tools Read,Grep,Glob`, with no MCP servers and no project settings or hooks loaded from the PR, so it can only read files. Codex runs as `codex exec --sandbox read-only`, with no user config, no rules and no `AGENTS.md`. Codex works through shell commands, so its instructions forbid running, building, installing or testing anything from the repository. Its sandbox also blocks file writes and network access, and any credential that shows up in its output is dropped.
 - **The agents never see your GitHub token.** They get an allowlisted environment, and their only output is JSON. The app does all GitHub writes itself.
 - **Throwaway checkouts.** Each review gets its own worktree of the PR head in a temp folder, made from the local repo copy, with symlinks disabled. It's deleted afterwards. Your GitHub token is passed to git through the environment and never written into the local copy.
-- **Never approves and never requests changes.** Draft mode posts a pending review. Publish mode posts a plain comment review.
+- **Approves only under strict rules, never requests changes.** Draft mode posts a pending review. Publish mode approves when the rules in [Confidence and approval](#confidence-and-approval) allow it, and posts a comment review otherwise. Text in a PR can't raise the confidence: the hard rules are checked by the app, not the model.
 - **Local dashboard.** It listens on `127.0.0.1` only, rejects foreign `Host` headers (DNS rebinding), and requires a custom header on every write (CSRF).
 - **Subscription terms.** It drives the official `claude` and `codex` CLIs with your own logins, for your own review queue. Don't share one instance with teammates. Each person should run their own.
 - **Company code.** These reviews send your repos' code to your personal Claude and ChatGPT accounts. Check that your employer allows it, and turn off model training in both accounts.
@@ -121,6 +138,7 @@ Everything is set on the dashboard's **Settings** page and stored in the app's d
 | Repositories | Review pull requests in / Never review | None. Add `owner/repo` or `owner/*` |
 | Posting to GitHub | Dry run | On |
 | | How reviews are posted | Draft, with optional exceptions per repo |
+| | Approve PRs that have no blockers | On, when confidence is at least high |
 | Reviewer | Who reviews | Codex |
 | | If Codex runs out, use Claude instead | On |
 | | Double-check blockers and majors | On |
@@ -134,7 +152,7 @@ Everything is set on the dashboard's **Settings** page and stored in the app's d
 | | Most nits per review | 5 |
 | Files and authors | Leave out of reviews | Lockfiles, vendored and generated files |
 | | Skip PRs by | dependabot, renovate, github-actions |
-| Labels | Label prefix | `ai-review` |
+| Labels | While reviewing / Left feedback / Approved | `dh: on review`, `dh: feedback`, `dh: approved` |
 
 Two things are set in `.env` instead, because the app needs them before the dashboard exists: `PORT` (default 4477) and `DATA_DIR` (default `./data`).
 

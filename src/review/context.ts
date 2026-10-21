@@ -21,6 +21,8 @@ export interface ReviewContext {
   issues: LinkedIssue[];
   incremental: boolean;
   large: boolean;
+  // Some files' diffs didn't fit; the model was told to read them in the checkout.
+  truncated: boolean;
   changedLines: number;
   previous: Finding[];
   prompt: string;
@@ -177,6 +179,7 @@ export async function buildContext(
     issues,
     incremental,
     large,
+    truncated: omitted.length > 0,
     changedLines,
     previous,
     prompt: parts.join('\n\n'),

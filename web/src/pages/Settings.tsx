@@ -278,7 +278,7 @@ export function SettingsPage({ overview }: { overview: Overview | null }) {
           hint={
             draft.defaultMode === 'draft'
               ? 'A pending review only you can see. You edit it and submit it yourself.'
-              : 'Posted straight away as a comment review under your name. Never approves or requests changes.'
+              : 'Posted straight away under your name. Approves the PR when the rules below allow it; never requests changes.'
           }
         >
           <Segmented
@@ -291,6 +291,32 @@ export function SettingsPage({ overview }: { overview: Overview | null }) {
             ]}
           />
         </Field>
+        <Toggle
+          checked={draft.approval.enabled}
+          onChange={(v) => edit((d) => void (d.approval.enabled = v))}
+          label={<strong>Approve PRs that have no blockers</strong>}
+          hint="Only published reviews approve. Never a draft (you decide when you submit it), a draft PR, your own PR, a PR with commits newer than the review, or one where you requested changes. An approval counts toward branch protection, so the PR may become mergeable."
+        />
+        {draft.approval.enabled && (
+          <Field
+            label="Approve when confidence is at least"
+            hint={
+              draft.approval.minConfidence === 'high'
+                ? 'High: no blockers or majors open, no open questions, requirements match, and both review passes are sure.'
+                : 'Medium also approves with majors open, open questions, partly matching requirements, or a large change.'
+            }
+          >
+            <Segmented
+              label="Minimum confidence"
+              value={draft.approval.minConfidence}
+              onChange={(v) => edit((d) => void (d.approval.minConfidence = v))}
+              options={[
+                ['high', 'High'],
+                ['medium', 'Medium'],
+              ]}
+            />
+          </Field>
+        )}
         <Field label="Exceptions per repo" hint="The first matching pattern wins." error={errorFor('repoModes')}>
           <div className="rows">
             {draft.repoModes.map((o, i) => (
@@ -433,20 +459,16 @@ export function SettingsPage({ overview }: { overview: Overview | null }) {
         </div>
       </Section>
 
-      <Section title="Labels">
-        <Field
-          label="Label prefix"
-          hint={`Labels look like ${draft.labels.prefix || 'ai-review'}:running, :done, :blocker and :failed.`}
-          error={errorFor('labels.prefix')}
-        >
-          <input value={draft.labels.prefix} onChange={(e) => edit((d) => void (d.labels.prefix = e.target.value))} />
+      <Section title="Labels" description="A PR carries one of these at a time. Each is created in the repo the first time it's needed.">
+        <Field label="While reviewing" hint="Stays on while your draft is unsubmitted." error={errorFor('labels.reviewing')}>
+          <input value={draft.labels.reviewing} onChange={(e) => edit((d) => void (d.labels.reviewing = e.target.value))} />
         </Field>
-        <Toggle
-          checked={draft.labels.blockerLabelInDraft}
-          onChange={(v) => edit((d) => void (d.labels.blockerLabelInDraft = v))}
-          label="Add the blocker label while the review is still a draft"
-          hint="Off: the label waits until you submit the review with a blocker kept, since the author can't see a draft."
-        />
+        <Field label="Left feedback" hint="Reviewed without approving." error={errorFor('labels.feedback')}>
+          <input value={draft.labels.feedback} onChange={(e) => edit((d) => void (d.labels.feedback = e.target.value))} />
+        </Field>
+        <Field label="Approved" hint="Approved for you, or you submitted your draft as an approval." error={errorFor('labels.approved')}>
+          <input value={draft.labels.approved} onChange={(e) => edit((d) => void (d.labels.approved = e.target.value))} />
+        </Field>
       </Section>
 
       <Section title="Advanced">

@@ -1,48 +1,38 @@
-import { findingMarker } from '../github/publish.ts';
+import { findingMarker, SIGNATURE } from '../github/publish.ts';
 import type { LinkedIssue } from '../github/prs.ts';
 import type { Finding, Severity, SpecStatus } from '../types.ts';
 
-const SEVERITY_LABEL: Record<Severity, string> = {
-  blocker: '🔴 Blocker',
-  major: '🟠 Major',
-  minor: '🟡 Minor',
-  nit: '⚪ Nit',
-};
+// Plain markdown: no emoji, no model details. Every comment ends with the signature.
 
-const SPEC_LABEL: Record<SpecStatus, string> = {
-  aligned: '✅ Matches the linked issue',
-  partial: '🟡 Partly matches the linked issue',
-  misaligned: '🔴 Doesn\'t match the linked issue',
-  no_spec: '➖ No linked issue to compare against',
-  not_checked: '➖ Not checked',
-};
+const SEVERITY_LABEL: Record<Severity, string> = { blocker: 'Blocker', major: 'Major', minor: 'Minor', nit: 'Nit' };
+const SEVERITIES: Severity[] = ['blocker', 'major', 'minor', 'nit'];
 
-const PROVIDER_NAME = { claude: 'Claude', codex: 'Codex' } as const;
-
-function provenance(f: Finding): string {
-  const who = f.model_id ? `${PROVIDER_NAME[f.model]} (${f.model_id})` : PROVIDER_NAME[f.model];
-  const parts = [`AI-assisted · ${who}`, `confidence ${f.confidence}`];
-  if (f.verification === 'confirmed') parts.push(`confirmed by ${PROVIDER_NAME[f.verified_by ?? f.model]}`);
-  if (f.verification === 'uncertain') parts.push(`unconfirmed by ${PROVIDER_NAME[f.verified_by ?? f.model]}`);
-  return parts.join(' · ');
-}
+const heading = (f: Finding) => `**${SEVERITY_LABEL[f.severity]} (${f.category}):** ${f.title}`;
+const oneLine = (text: string) => text.replace(/\s*\n+\s*/g, ' ').trim();
 
 export function inlineBody(f: Finding): string {
-  return [
-    `**${SEVERITY_LABEL[f.severity]} · ${f.category}**: ${f.title}`,
-    '',
-    f.problem,
-    '',
-    `**Suggestion:** ${f.suggestion}`,
-    '',
-    `<sub>${provenance(f)}</sub>`,
-    findingMarker(f.id),
-  ].join('\n');
+  return [heading(f), '', f.problem, '', `**Suggestion:** ${f.suggestion}`, '', SIGNATURE, findingMarker(f.id)].join('\n');
+}
+
+// "2 blockers, 1 major, 3 minor"
+export function countsLine(findings: Finding[]): string {
+  return SEVERITIES.map((sev) => ({ sev, n: findings.filter((f) => f.severity === sev).length }))
+    .filter((c) => c.n > 0)
+    .map(({ sev, n }) => `${n} ${sev}${n > 1 && (sev === 'blocker' || sev === 'nit') ? 's' : ''}`)
+    .join(', ');
+}
+
+function requirementsLine(status: SpecStatus, notes: string, issues: LinkedIssue[], repo: string): string | null {
+  if (status === 'not_checked') return null;
+  if (status === 'no_spec' || !issues.length) return 'No linked issue to check against.';
+  const refs = issues.map((i) => (i.repo.toLowerCase() === repo.toLowerCase() ? `#${i.number}` : `${i.repo}#${i.number}`)).join(', ');
+  const verdict = { aligned: `Matches ${refs}.`, partial: `Partly matches ${refs}.`, misaligned: `Doesn't match ${refs}.` }[status];
+  return notes.trim() ? `${verdict} ${oneLine(notes)}` : verdict;
 }
 
 export interface SummaryInput {
+  repo: string;
   headSha: string;
-  sinceSha: string | null;
   summaries: string[];
   specStatus: SpecStatus;
   specNotes: string;
@@ -57,44 +47,37 @@ export interface SummaryInput {
 }
 
 export function summaryBody(s: SummaryInput): string {
-  const out: string[] = ['## 🤖 AI-assisted review', ''];
-  out.push(...s.summaries.filter(Boolean).map((t) => `${t}\n`));
+  const counts = countsLine(s.findings);
+  const out: string[] = [counts ? `**${counts}**` : '**No issues found.**', ''];
+  for (const text of s.summaries.map((t) => t.trim()).filter(Boolean)) out.push(text, '');
 
-  const issueRefs = s.issues.map((i) => `[${i.repo}#${i.number}](${i.url})`).join(', ');
-  out.push(`**Requirements:** ${SPEC_LABEL[s.specStatus]}${issueRefs ? ` (${issueRefs})` : ''}${s.specNotes ? `. ${s.specNotes}` : ''}`, '');
-
-  const counts = (['blocker', 'major', 'minor', 'nit'] as Severity[])
-    .map((sev) => ({ sev, n: s.findings.filter((f) => f.severity === sev).length }))
-    .filter((c) => c.n > 0);
-  out.push(counts.length ? `**Findings:** ${counts.map((c) => `${SEVERITY_LABEL[c.sev]} ${c.n}`).join(' · ')}` : '**Findings:** none worth raising.', '');
+  const requirements = requirementsLine(s.specStatus, s.specNotes, s.issues, s.repo);
+  if (requirements) out.push(`**Requirements:** ${requirements}`, '');
 
   const general = s.findings.filter((f) => f.status === 'summary');
   if (general.length) {
-    out.push(s.inlineFailed ? '### Findings' : '### Findings not tied to a changed line', '');
+    out.push(s.inlineFailed ? '**Findings**' : '**Not tied to a changed line**', '');
     for (const f of general) {
-      const where = f.file ? `\`${f.file}${f.line ? `:${f.line}` : ''}\`` : '';
-      out.push(`- **${SEVERITY_LABEL[f.severity]} · ${f.category}** ${where}: ${f.title}`);
-      out.push(`  ${f.problem.replace(/\n+/g, ' ')}`);
-      out.push(`  *Suggestion:* ${f.suggestion.replace(/\n+/g, ' ')} <sub>${provenance(f)}</sub>`);
+      const where = f.file ? ` (\`${f.file}${f.line ? `:${f.line}` : ''}\`)` : '';
+      out.push(`- ${heading(f)}${where}`);
+      out.push(`  ${oneLine(f.problem)}`);
+      out.push(`  Suggestion: ${oneLine(f.suggestion)}`);
       out.push(`  ${findingMarker(f.id)}`);
     }
     out.push('');
   }
 
-  if (s.questions.length) {
-    out.push('### Questions for the author', '', ...s.questions.map((q) => `- ${q}`), '');
-  }
+  if (s.questions.length) out.push('**Questions**', '', ...s.questions.map((q) => `- ${oneLine(q)}`), '');
 
   if (s.resolved.length) {
-    out.push('### Fixed since the last review', '', ...s.resolved.map((f) => `- ~~${f.title}~~ (\`${f.file}\`)`), '');
+    out.push('**Fixed since the last review**', '', ...s.resolved.map((f) => `- ~~${f.title}~~${f.file ? ` (\`${f.file}\`)` : ''}`), '');
   }
 
   const notes: string[] = [];
-  if (s.large) notes.push('Large change: this review covers the highest risks only.');
-  if (s.excluded.length) notes.push(`Skipped ${s.excluded.length} generated or lock file(s).`);
-  const scope = s.sinceSha ? `changes ${s.sinceSha.slice(0, 7)}..${s.headSha.slice(0, 7)}` : `commit ${s.headSha.slice(0, 7)}`;
-  notes.push(`Reviewed ${scope}.`);
-  out.push(`<sub>${notes.join(' ')}</sub>`);
-  out.push(`<!-- ai-review sha=${s.headSha} job=${s.jobId} -->`);
+  if (s.large) notes.push('Large change: only the highest risks are covered.');
+  if (s.excluded.length) notes.push(`Skipped ${s.excluded.length} generated or lock file${s.excluded.length > 1 ? 's' : ''}.`);
+  if (notes.length) out.push(notes.join(' '), '');
+
+  out.push(SIGNATURE, `<!-- ai-review sha=${s.headSha} job=${s.jobId} -->`);
   return out.join('\n');
 }

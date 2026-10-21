@@ -1,15 +1,27 @@
 import type { SettingsStore } from '../settings.ts';
 import type { Db } from '../db.ts';
 import type { GitHub } from '../github/client.ts';
-import { addLabel } from '../github/labels.ts';
+import { removeLabel, showLabel } from '../github/labels.ts';
+import { getPr } from '../github/prs.ts';
 import { FINDING_MARKER, getReview, listReviewComments } from '../github/publish.ts';
-import { inlineBody } from '../review/format.ts';
 import type { Finding, Job } from '../types.ts';
 
 const stripMarker = (body: string) => body.replace(FINDING_MARKER, '').trim();
 
+// Comments posted before the wording changed have no stored copy; they were written like this.
+const LEGACY_SEVERITY = { blocker: '🔴 Blocker', major: '🟠 Major', minor: '🟡 Minor', nit: '⚪ Nit' } as const;
+const LEGACY_PROVIDER = { claude: 'Claude', codex: 'Codex' } as const;
+export function legacyInlineBody(f: Finding): string {
+  const who = f.model_id ? `${LEGACY_PROVIDER[f.model]} (${f.model_id})` : LEGACY_PROVIDER[f.model];
+  const parts = [`AI-assisted · ${who}`, `confidence ${f.confidence}`];
+  if (f.verification === 'confirmed') parts.push(`confirmed by ${LEGACY_PROVIDER[f.verified_by ?? f.model]}`);
+  if (f.verification === 'uncertain') parts.push(`unconfirmed by ${LEGACY_PROVIDER[f.verified_by ?? f.model]}`);
+  return [`**${LEGACY_SEVERITY[f.severity]} · ${f.category}**: ${f.title}`, '', f.problem, '', `**Suggestion:** ${f.suggestion}`, '', `<sub>${parts.join(' · ')}</sub>`].join('\n');
+}
+
 // Learns what you did with each draft: which comments you kept, edited or deleted
-// before submitting. This is what the leaderboards' keep rate is built on.
+// before submitting, which is what the leaderboards' keep rate is built on. Once you
+// submit, the PR's label follows what you chose: approved, or feedback.
 export class OutcomeSync {
   private readonly gh: GitHub;
   private readonly cfg: SettingsStore;
@@ -45,6 +57,7 @@ export class OutcomeSync {
       this.db.updateJob(job.id, { review_state: 'DELETED' });
       for (const f of findings) this.db.updateFinding(f.id, { outcome: 'deleted' });
       this.db.event(job.id, 'You discarded the draft review');
+      await removeLabel(this.gh, job.repo, job.pr_number, this.cfg.labels.reviewing);
       return;
     }
     if (review.state === 'PENDING') return;
@@ -57,22 +70,17 @@ export class OutcomeSync {
     }
     const commentById = new Map(comments.map((c) => [c.id, c.body]));
 
-    let keptBlocker = false;
     let kept = 0;
     for (const f of findings) {
       const outcome = this.outcomeFor(f, byFinding, commentById, review.body);
-      if (outcome === 'kept' || outcome === 'edited') {
-        kept++;
-        if (f.severity === 'blocker') keptBlocker = true;
-      }
+      if (outcome === 'kept' || outcome === 'edited') kept++;
       this.db.updateFinding(f.id, { outcome });
     }
     this.db.updateJob(job.id, { review_state: review.state });
     this.db.event(job.id, `You submitted the review (${review.state.toLowerCase()}): kept ${kept} of ${findings.length} finding(s)`);
 
-    if (keptBlocker && !this.cfg.labels.blockerLabelInDraft) {
-      await addLabel(this.gh, job.repo, job.pr_number, this.cfg.labelName('blocker'));
-    }
+    const pr = await getPr(this.gh, job.repo, job.pr_number);
+    await showLabel(this.gh, job.repo, job.pr_number, this.cfg.labels, review.state === 'APPROVED' ? 'approved' : 'feedback', pr.labels);
   }
 
   private outcomeFor(f: Finding, byFinding: Map<number, string>, byCommentId: Map<number, string>, reviewBody: string): Finding['outcome'] {
@@ -82,6 +90,6 @@ export class OutcomeSync {
     }
     const body = byFinding.get(f.id) ?? (f.comment_id ? byCommentId.get(f.comment_id) : undefined);
     if (body === undefined) return 'deleted';
-    return stripMarker(body) === stripMarker(inlineBody(f)) ? 'kept' : 'edited';
+    return stripMarker(body) === stripMarker(f.posted_body ?? legacyInlineBody(f)) ? 'kept' : 'edited';
   }
 }

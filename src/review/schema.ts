@@ -26,7 +26,7 @@ const findingJson = {
 export const reviewSchema = {
   type: 'object',
   additionalProperties: false,
-  required: ['summary', 'spec_alignment', 'findings', 'questions_for_author', 'resolved_previous_ids'],
+  required: ['summary', 'spec_alignment', 'findings', 'questions_for_author', 'resolved_previous_ids', 'review_confidence'],
   properties: {
     summary: str,
     spec_alignment: {
@@ -41,6 +41,15 @@ export const reviewSchema = {
     findings: { type: 'array', items: findingJson },
     questions_for_author: { type: 'array', items: str },
     resolved_previous_ids: { type: 'array', items: { type: 'integer' } },
+    review_confidence: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['level', 'reason'],
+      properties: {
+        level: enumOf(['high', 'medium', 'low']),
+        reason: str,
+      },
+    },
   },
 };
 
@@ -92,6 +101,10 @@ export const ReviewOut = z.object({
   findings: z.array(FindingOut),
   questions_for_author: z.array(z.string()),
   resolved_previous_ids: z.array(z.number().int()),
+  review_confidence: z.object({
+    level: z.enum(['high', 'medium', 'low']),
+    reason: z.string(),
+  }),
 });
 export type ReviewOut = z.infer<typeof ReviewOut>;
 

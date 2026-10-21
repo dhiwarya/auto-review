@@ -5,11 +5,12 @@ import type { SettingsStore } from '../settings.ts';
 import type { Db } from '../db.ts';
 import type { Checkout, RepoCache } from '../git/mirror.ts';
 import type { GitHub } from '../github/client.ts';
-import { addLabel, removeLabel } from '../github/labels.ts';
-import { getPr } from '../github/prs.ts';
-import { PendingReviewExists, postReview, type InlineComment } from '../github/publish.ts';
+import { removeLabel, showLabel } from '../github/labels.ts';
+import { getPr, type PrInfo } from '../github/prs.ts';
+import { myVerdict, PendingReviewExists, postReview, type InlineComment, type ReviewEvent } from '../github/publish.ts';
 import { NoProviderAvailable, type Router } from '../llm/router.ts';
 import type { Finding, Job, PostPreview, Provider, ReviewMode } from '../types.ts';
+import { assess, atLeast, openBlockers } from './confidence.ts';
 import { buildContext, type ReviewContext } from './context.ts';
 import { inlineBody, summaryBody } from './format.ts';
 import { mainInstructions, securityInstructions, verifyInstructions } from './prompts.ts';
@@ -21,8 +22,6 @@ export class JobObsolete extends Error {}
 
 // Posting a dry-run review isn't possible right now; the message says why.
 export class PostRefused extends Error {}
-
-
 
 export class ReviewPipeline {
   private readonly gh: GitHub;
@@ -57,7 +56,7 @@ export class ReviewPipeline {
       return;
     }
 
-    await this.labelStart(job);
+    await this.labelStart(job, pr);
 
     const workDir = await fs.mkdtemp(path.join(os.tmpdir(), `auto-reviewer-work-${job.id}-`));
     let checkout: Checkout | null = null;
@@ -155,22 +154,39 @@ export class ReviewPipeline {
       for (const f of resolved) this.db.updateFinding(f.id, { resolved_by_job: job.id });
 
       const posted = inserted.filter((f) => f.status !== 'dropped');
+      const questions = [...mainOut.questions_for_author, ...secOut.questions_for_author].slice(0, 4);
       const body = summaryBody({
+        repo: job.repo,
         headSha: job.head_sha,
-        sinceSha: ctx.incremental ? job.since_sha : null,
         summaries: [mainOut.summary, secOut.summary],
         specStatus: mainOut.spec_alignment.status,
         specNotes: mainOut.spec_alignment.notes,
         issues: ctx.issues,
         findings: posted,
-        questions: [...mainOut.questions_for_author, ...secOut.questions_for_author].slice(0, 4),
+        questions,
         resolved,
         large: ctx.large,
         excluded: ctx.excluded,
         inlineFailed: false,
         jobId: job.id,
       });
-      job = this.db.updateJob(job.id, { review_body: body, spec_status: mainOut.spec_alignment.status });
+      const assessment = assess({
+        findings: posted,
+        openEarlier: previous.filter((f) => !resolvedIds.has(f.id)),
+        specStatus: mainOut.spec_alignment.status,
+        questions: questions.length,
+        large: ctx.large,
+        truncated: ctx.truncated,
+        injection: placed.some((p) => p.drop_reason?.includes('exfiltration')),
+        passes: [mainOut.review_confidence, secOut.review_confidence],
+      });
+      this.db.event(job.id, `Confidence ${assessment.level}${assessment.reasons.length ? `: ${assessment.reasons.join('; ')}` : ''}`);
+      job = this.db.updateJob(job.id, {
+        review_body: body,
+        spec_status: mainOut.spec_alignment.status,
+        confidence: assessment.level,
+        confidence_notes: assessment.reasons.join('\n') || null,
+      });
 
       if (signal.aborted) throw signal.reason;
       await this.publish(job, inserted);
@@ -259,39 +275,65 @@ export class ReviewPipeline {
     // Last check before speaking for you: don't post on a commit that's already outdated.
     const pr = await getPr(this.gh, job.repo, job.pr_number);
     if (pr.headSha !== job.head_sha) throw new JobObsolete(`superseded by new commits (${pr.headSha.slice(0, 7)})`);
-    await this.post(job, findings, job.mode);
+    await this.post(job, findings, job.mode, pr);
   }
 
-  // Sends a prepared review to GitHub on the reviewed commit, as a pending draft or a
-  // published comment review, and sets the labels.
-  private async post(job: Job, findings: Finding[], mode: ReviewMode) {
+  // Why this review shouldn't approve the PR, or null when it should. Checked again right
+  // before posting, against the PR as it is then.
+  private async whyNotApprove(job: Job, pr: PrInfo, posted: Finding[]): Promise<string | null> {
+    const { enabled, minConfidence } = this.cfg.approval;
+    if (!enabled) return 'Approving is turned off in Settings';
+    const blockers = openBlockers([...posted, ...this.previousFindings(job)]);
+    if (blockers) return `${blockers} blocker${blockers === 1 ? '' : 's'} still open`;
+    if (!job.confidence) return 'This review has no confidence level (it was made before approvals existed)';
+    if (!atLeast(job.confidence, minConfidence)) return `Confidence is ${job.confidence}; approving needs ${minConfidence}`;
+    if (pr.draft) return 'The PR is still a draft';
+    if (pr.author.toLowerCase() === this.gh.me.toLowerCase()) return "GitHub doesn't let you approve your own PR";
+    if (pr.headSha !== job.head_sha) return 'The PR has new commits since this review';
+    if ((await myVerdict(this.gh, job.repo, job.pr_number)) === 'CHANGES_REQUESTED') return 'You requested changes on this PR yourself';
+    return null;
+  }
+
+  // Sends a prepared review to GitHub on the reviewed commit and sets the label. Drafts are
+  // pending reviews only you can see; published reviews approve the PR when nothing stands
+  // in the way, and comment otherwise.
+  private async post(job: Job, findings: Finding[], mode: ReviewMode, pr: PrInfo) {
     const posted = findings.filter((f) => f.status !== 'dropped');
-    const hasBlocker = posted.some((f) => f.severity === 'blocker');
     const inline: InlineComment[] = posted
       .filter((f) => f.status === 'inline' && f.line !== null)
       .map((f) => ({ findingId: f.id, path: f.file, line: f.line!, body: inlineBody(f) }));
+    const approveNote = await this.whyNotApprove(job, pr, posted);
+    const approve = mode === 'publish' && approveNote === null;
+    const event: ReviewEvent = mode === 'draft' ? null : approve ? 'APPROVE' : 'COMMENT';
 
-    this.step(job, mode === 'draft' ? 'Posting draft review (only you can see it)' : 'Posting review comment', 95);
-    const res = await postReview(this.gh, job.repo, job.pr_number, job.head_sha, mode, job.review_body ?? '', inline);
+    this.step(job, mode === 'draft' ? 'Posting draft review (only you can see it)' : approve ? 'Approving the PR' : 'Posting review comment', 95);
+    const res = await postReview(this.gh, job.repo, job.pr_number, job.head_sha, event, job.review_body ?? '', inline);
     if (res.droppedInline) {
       this.db.event(job.id, 'GitHub rejected an inline comment position, so every finding went into the review body instead', 'warn');
       for (const f of inline) this.db.updateFinding(f.findingId, { status: 'summary' });
+    } else {
+      for (const c of inline) this.db.updateFinding(c.findingId, { posted_body: c.body });
     }
     for (const [findingId, commentId] of res.commentIds) this.db.updateFinding(findingId, { comment_id: commentId });
     for (const f of posted) this.db.updateFinding(f.id, { outcome: mode === 'draft' ? 'pending' : 'published' });
 
-    const labelOk = await this.labelFinish({ ...job, mode }, hasBlocker);
+    const label = mode === 'draft' ? 'reviewing' : approve ? 'approved' : 'feedback';
+    const labelOk = await showLabel(this.gh, job.repo, job.pr_number, this.cfg.labels, label, pr.labels);
     this.db.setState(job.id, 'done', {
       mode,
       dry_run: 0, // from here on it's a real review: follow-ups build on it and kept comments are tracked
       review_id: res.id,
       review_url: res.url,
       review_state: res.state,
+      approve_note: approveNote,
       label_ok: labelOk ? 1 : 0,
       progress: 100,
-      step: mode === 'draft' ? 'Draft review ready for you on GitHub' : 'Review posted',
+      step: mode === 'draft' ? 'Draft review ready for you on GitHub' : approve ? 'Approved' : 'Review posted',
     });
     this.db.event(job.id, `Review ${res.state.toLowerCase()} with ${res.commentIds.size} inline comment(s): ${res.url}`);
+    if (approve) this.db.event(job.id, `Approved the PR for you (confidence ${job.confidence})`);
+    else if (mode === 'publish') this.db.event(job.id, `Not approved: ${approveNote}`);
+    else if (approveNote === null) this.db.event(job.id, 'No blockers and confidence is high enough: submit the draft as an approval if you agree');
   }
 
   // ---- posting a dry-run review from the dashboard
@@ -314,15 +356,15 @@ export class ReviewPipeline {
     const pr = await getPr(this.gh, job.repo, job.pr_number);
     if (pr.state !== 'open') throw new PostRefused('This PR is no longer open');
     const findings = this.db.findings(id).filter((f) => f.status !== 'dropped');
+    const approveNote = await this.whyNotApprove(job, pr, findings);
     return {
       inline: findings.filter((f) => f.status === 'inline' && f.line !== null).length,
       inSummary: findings.filter((f) => f.status === 'summary' || (f.status === 'inline' && f.line === null)).length,
       reviewedSha: job.head_sha,
       currentSha: pr.headSha,
       defaultMode: this.cfg.modeFor(job.repo),
-      doneLabel: this.cfg.labelName('done'),
-      blockerLabel: findings.some((f) => f.severity === 'blocker') ? this.cfg.labelName('blocker') : null,
-      blockerLabelInDraft: this.cfg.labels.blockerLabelInDraft,
+      approveNote,
+      labels: { draft: this.cfg.labels.reviewing, publish: approveNote === null ? this.cfg.labels.approved : this.cfg.labels.feedback },
     };
   }
 
@@ -340,7 +382,7 @@ export class ReviewPipeline {
           'warn',
         );
       }
-      await this.post(job, this.db.findings(id), mode);
+      await this.post(job, this.db.findings(id), mode, pr);
       return this.db.job(id)!;
     } catch (err) {
       // Put the review back as it was, ready to try again.
@@ -355,32 +397,20 @@ export class ReviewPipeline {
     }
   }
 
-  private async labelStart(job: Job) {
+  private async labelStart(job: Job, pr: PrInfo) {
     if (job.dry_run) return;
-    const ok = await addLabel(this.gh, job.repo, job.pr_number, this.cfg.labelName('running'));
+    const ok = await showLabel(this.gh, job.repo, job.pr_number, this.cfg.labels, 'reviewing', pr.labels);
     if (!ok) this.db.event(job.id, 'Can\'t set labels on this repo (needs triage access); the review body carries a marker instead', 'warn');
-    await removeLabel(this.gh, job.repo, job.pr_number, this.cfg.labelName('failed'));
   }
 
-  private async labelFinish(job: Job, hasBlocker: boolean): Promise<boolean> {
-    const { repo, pr_number: n } = job;
-    await removeLabel(this.gh, repo, n, this.cfg.labelName('running'));
-    const ok = await addLabel(this.gh, repo, n, this.cfg.labelName('done'));
-    const showBlocker = hasBlocker && (job.mode === 'publish' || this.cfg.labels.blockerLabelInDraft);
-    if (showBlocker) await addLabel(this.gh, repo, n, this.cfg.labelName('blocker'));
-    else await removeLabel(this.gh, repo, n, this.cfg.labelName('blocker'));
-    return ok;
-  }
-
+  // A review that stops early takes its "on review" label with it.
   async labelFailed(job: Job) {
     if (job.dry_run) return;
-    await removeLabel(this.gh, job.repo, job.pr_number, this.cfg.labelName('running'));
-    await addLabel(this.gh, job.repo, job.pr_number, this.cfg.labelName('failed'));
+    await removeLabel(this.gh, job.repo, job.pr_number, this.cfg.labels.reviewing);
   }
 
   async labelCancelled(job: Job) {
-    if (job.dry_run) return;
-    await removeLabel(this.gh, job.repo, job.pr_number, this.cfg.labelName('running'));
+    await this.labelFailed(job);
   }
 }
 

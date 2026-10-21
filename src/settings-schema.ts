@@ -15,6 +15,8 @@ const repoPattern = z
   .pipe(z.string().regex(/^[\w.*?-]+\/[\w.*?-]+$/, 'Use owner/repo, or a pattern such as owner/*'));
 const clock = z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/, 'Use 24-hour HH:MM');
 const int = (min: number, max: number) => z.number().int().min(min).max(max);
+const labelName = z.string().trim().min(1, 'Give the label a name').max(50, 'GitHub allows up to 50 characters');
+const LABEL_KINDS = ['reviewing', 'feedback', 'approved'] as const;
 
 // A provider's models, tried in order. null = the CLI's own default model.
 const providerModels = z.object({
@@ -88,16 +90,30 @@ export const SettingsSchema = z.object({
       maxAttempts: int(1, 10).default(3),
     })
     .prefault({}),
+  // Approve the PR for you when a published review finds no open blockers and is
+  // confident enough. Drafts are never approved: you decide when you submit them.
+  approval: z
+    .object({
+      enabled: z.boolean().default(true),
+      minConfidence: z.enum(['high', 'medium']).default('high'),
+    })
+    .prefault({}),
+  // A PR carries one of these at a time. "reviewing" stays while your draft is unsubmitted.
   labels: z
     .object({
-      prefix: z
-        .string()
-        .trim()
-        .regex(/^[\w.-]{1,30}$/, 'Letters, numbers, dots, dashes and underscores, up to 30')
-        .default('ai-review'),
-      // In draft mode the author can't see the draft yet, so by default the blocker
-      // label waits until you submit the review with at least one blocker kept.
-      blockerLabelInDraft: z.boolean().default(false),
+      reviewing: labelName.default('dh: on review'),
+      feedback: labelName.default('dh: feedback'),
+      approved: labelName.default('dh: approved'),
+    })
+    .superRefine((labels, ctx) => {
+      // GitHub label names ignore case.
+      const seen = new Map<string, string>();
+      for (const kind of LABEL_KINDS) {
+        const key = labels[kind].toLowerCase();
+        const other = seen.get(key);
+        if (other) ctx.addIssue({ code: 'custom', path: [kind], message: `Same name as the ${other} label` });
+        else seen.set(key, kind);
+      }
     })
     .prefault({}),
   // Keep each PR checkout after its review, for debugging.

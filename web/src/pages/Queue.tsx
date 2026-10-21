@@ -7,6 +7,7 @@ const ACTIVE = new Set(['running', 'queued', 'waiting']);
 
 function modeLabel(j: Job) {
   if (j.dry_run) return 'dry run';
+  if (j.review_state === 'APPROVED') return 'approved';
   return j.mode === 'draft' ? 'draft' : 'published';
 }
 
