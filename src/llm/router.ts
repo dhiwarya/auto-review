@@ -1,7 +1,8 @@
 import type { SettingsStore } from '../settings.ts';
 import type { Db } from '../db.ts';
 import type { ModelStatus, Provider, ProviderStatus } from '../types.ts';
-import { runClaude, runCodex, type AgentTask } from './agents.ts';
+import { randomUUID } from 'node:crypto';
+import { runClaude, runCodex, type AgentTask, type StepEvent } from './agents.ts';
 import { ContentRefused, ProviderUnavailable } from './run.ts';
 import { bus } from '../bus.ts';
 
@@ -13,7 +14,7 @@ export class NoProviderAvailable extends Error {
   }
 }
 
-export type RouterTask = Omit<AgentTask, 'model'>;
+export type RouterTask = Omit<AgentTask, 'model' | 'onStep'>;
 
 const modelKey = (p: Provider, model: string | null) => `${p}/${model ?? 'default'}`;
 
@@ -106,26 +107,39 @@ export class Router {
         if (this.modelBlockedUntil(provider, model)) continue;
         const fellBack = provider !== preferred || model !== firstChoice;
         const started = Date.now();
+        // Everything this run does is recorded under its key, live, for the job's page.
+        const runKey = randomUUID();
+        const promptChars = task.instructions.length + task.prompt.length;
+        let reportedError = false;
+        const step = (s: StepEvent) => {
+          reportedError ||= s.kind === 'error';
+          this.db.recordStep({ job_id: jobId, run_key: runKey, purpose, provider, model, ...s });
+          bus.stepsChanged(jobId);
+        };
+        step({ ref: null, kind: 'start', title: `Started ${provider} ${model ?? '(default model)'}${fellBack ? ' as a stand-in' : ''}`, status: 'ok' });
         try {
+          const run = { ...task, model, onStep: step };
           const res =
             provider === 'claude'
-              ? await runClaude({ ...task, model }, { claudeMaxTurns: this.cfg.limits.claudeMaxTurns, claudeEffort: this.cfg.models.claudeEffort })
-              : await runCodex({ ...task, model });
+              ? await runClaude(run, { claudeMaxTurns: this.cfg.limits.claudeMaxTurns, claudeEffort: this.cfg.models.claudeEffort })
+              : await runCodex(run);
           const u = res.usage;
           this.db.insertRun({
-            job_id: jobId, purpose, provider, model, ok: 1, fell_back: fellBack ? 1 : 0, duration_ms: res.durationMs, error: null,
+            job_id: jobId, run_key: runKey, purpose, provider, model, ok: 1, fell_back: fellBack ? 1 : 0, duration_ms: res.durationMs, error: null,
             turns: u.turns, tool_calls: u.toolCalls, input_tokens: u.inputTokens, cached_input_tokens: u.cachedInputTokens,
-            output_tokens: u.outputTokens, cost_usd: u.costUsd,
+            output_tokens: u.outputTokens, cost_usd: u.costUsd, prompt_chars: promptChars, output: JSON.stringify(res.output),
           });
+          bus.stepsChanged(jobId);
           this.db.setKv(`last_error.${modelKey(provider, model)}`, null);
           this.db.setKv(`last_error.${provider}`, null);
           return { provider, model, output: res.output };
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
           this.db.insertRun({
-            job_id: jobId, purpose, provider, model, ok: 0, fell_back: fellBack ? 1 : 0, duration_ms: Date.now() - started, error: message.slice(0, 500),
-            turns: null, tool_calls: null, input_tokens: null, cached_input_tokens: null, output_tokens: null, cost_usd: null,
+            job_id: jobId, run_key: runKey, purpose, provider, model, ok: 0, fell_back: fellBack ? 1 : 0, duration_ms: Date.now() - started, error: message.slice(0, 500),
+            turns: null, tool_calls: null, input_tokens: null, cached_input_tokens: null, output_tokens: null, cost_usd: null, prompt_chars: promptChars,
           });
+          if (!reportedError) step({ ref: null, kind: 'error', title: message.split('\n')[0].slice(0, 200), detail: message, status: 'failed' });
           if (task.signal?.aborted) throw err;
           if (err instanceof ContentRefused) {
             this.db.event(jobId, `${provider} ${model ?? '(default model)'} declined the ${purpose} pass (flagged by its safety filter); trying the next model`, 'warn');

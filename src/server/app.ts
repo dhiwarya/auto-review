@@ -93,8 +93,13 @@ export async function startServer(deps: Deps) {
       findings: db.findings(job.id),
       events: db.events(job.id),
       runs: db.runs(job.id),
+      evidence: db.evidence(job.id),
+      steps: db.steps(job.id),
     } satisfies JobDetail;
   });
+
+  // A step's full text (command output, a tool's result), loaded when you open it.
+  app.get<{ Params: { id: string } }>('/api/steps/:id', async (req) => ({ detail: db.stepDetail(Number(req.params.id)) }));
 
   app.post<{ Body: { pr?: string } }>('/api/jobs', async (req, reply) => {
     const ref = parsePrRef(req.body?.pr ?? '');
@@ -182,7 +187,7 @@ export async function startServer(deps: Deps) {
     let pending: NodeJS.Timeout | null = null;
     const onJob = (msg: StreamMessage) => {
       send(msg);
-      onOverview();
+      if (msg.type !== 'steps') onOverview(); // a model's steps don't change the overview
     };
     const onOverview = () => {
       if (pending) return;

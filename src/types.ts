@@ -114,10 +114,67 @@ export interface JobEvent {
   created_at: string;
 }
 
+// What a review gathered before any model ran: the diff, linked issues and PRs, guidelines
+// and history. One per job; a re-check has no diff of its own, but reads the discussion.
+export interface Evidence {
+  diff: {
+    baseSha: string;
+    headSha: string;
+    sinceSha: string | null; // set for a follow-up of only the new commits
+    prFiles: number; // every file in the PR, even when only some are reviewed
+    files: EvidenceFile[];
+    changedLines: number;
+    diffChars: number;
+    maxDiffChars: number;
+    large: boolean;
+  } | null;
+  issues: { ref: string; title: string; url: string; comments: number; linkedBy: 'closes' | 'mentioned' }[];
+  prs: { ref: string; title: string; url: string }[]; // other PRs the description mentions
+  guidelines: string[];
+  history: { file: string; commits: number }[];
+  previousFindings: number;
+  discussion: { threadReplies: number; conversation: number } | null; // re-checks only
+  promptChars: number;
+}
+
+// reviewed: its diff is in the prompt. too_long: the diff didn't fit, the model was told
+// to read the file. excluded: a lock or generated file.
+export interface EvidenceFile {
+  name: string;
+  status: string;
+  additions: number;
+  deletions: number;
+  state: 'reviewed' | 'too_long' | 'excluded';
+}
+
+export type StepKind = 'start' | 'command' | 'tool' | 'reasoning' | 'message' | 'output' | 'error';
+export type StepStatus = 'running' | 'ok' | 'failed';
+
+// One thing a model did during a run, recorded as it happens. `detail` (command output, a
+// tool's result, the full message) is loaded separately, when a step is opened.
+export interface Step {
+  id: number;
+  job_id: number;
+  run_key: string; // one model run; matches Run.run_key once the run has finished
+  purpose: string;
+  provider: Provider;
+  model: string | null;
+  ref: string | null; // the CLI's own id for the item, to pair a start with its result
+  kind: StepKind;
+  title: string;
+  status: StepStatus;
+  detail_chars: number;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface Run {
   id: number;
   job_id: number;
-  purpose: string; // main | security | verify
+  run_key: string | null; // null for runs made before steps were recorded
+  prompt_chars: number | null;
+  output: string | null; // the structured answer, as JSON
+  purpose: string; // main | security | verify | recheck
   provider: Provider;
   model: string | null;
   ok: number;
@@ -186,6 +243,8 @@ export interface JobDetail {
   findings: Finding[];
   events: JobEvent[];
   runs: Run[];
+  evidence: Evidence | null; // null for reviews made before evidence was recorded
+  steps: Step[];
 }
 
 export type LeaderboardKind = 'models' | 'repos' | 'authors';
@@ -203,6 +262,7 @@ export interface Leaderboard {
 
 export type StreamMessage =
   | { type: 'job'; job: Job }
+  | { type: 'steps'; jobId: number } // a model run of this job did something
   | { type: 'overview'; overview: Overview };
 
 // What posting a dry-run review would do, checked against the PR as it is now.

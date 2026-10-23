@@ -4,15 +4,16 @@ import type { GitHub } from '../github/client.ts';
 import { changedLineCount } from '../github/diff.ts';
 import {
   compareCommits,
-  getLinkedIssues,
+  getLinkedRefs,
   listPrFiles,
   type LinkedIssue,
+  type LinkedPr,
   type PrComment,
   type PrFile,
   type PrInfo,
 } from '../github/prs.ts';
 import { SIGNATURE } from '../github/publish.ts';
-import type { Finding } from '../types.ts';
+import type { Evidence, Finding } from '../types.ts';
 
 export interface ReviewContext {
   pr: PrInfo;
@@ -28,6 +29,7 @@ export interface ReviewContext {
   changedLines: number;
   previous: Finding[];
   prompt: string;
+  evidence: Evidence;
 }
 
 const clip = (text: string, max: number) => (text.length > max ? `${text.slice(0, max)}\n…[truncated ${text.length - max} chars]` : text);
@@ -126,7 +128,7 @@ export async function buildContext(
   const changedLines = changedLineCount(included);
   const large = changedLines > cfg.limits.largePrLines;
 
-  const issues = await getLinkedIssues(gh, pr);
+  const { issues, prs } = await getLinkedRefs(gh, pr);
   // Read from the base commit so the PR can't rewrite its own review rules.
   const guidelines: { path: string; text: string }[] = [];
   for (const file of GUIDELINE_FILES) {
@@ -205,6 +207,33 @@ export async function buildContext(
   if (omitted.length) {
     parts.push(`The diff was too long to include in full. Read these files in the checkout instead:\n${omitted.map((f) => `- ${f}`).join('\n')}`);
   }
+  const prompt = parts.join('\n\n');
+
+  const evidence: Evidence = {
+    diff: {
+      baseSha: pr.baseSha,
+      headSha: pr.headSha,
+      sinceSha: incremental ? sinceSha : null,
+      prFiles: prFiles.length,
+      files: reviewFiles.map((f) => ({
+        name: f.filename,
+        status: f.status,
+        additions: f.additions,
+        deletions: f.deletions,
+        state: cfg.isExcludedFile(f.filename) ? 'excluded' : omitted.includes(f.filename) ? 'too_long' : 'reviewed',
+      })),
+      changedLines,
+      diffChars: diff.length,
+      maxDiffChars: cfg.limits.maxDiffChars,
+      large,
+    },
+    ...refsEvidence(issues, prs),
+    guidelines: guidelines.map((g) => g.path),
+    history: history.map((h) => ({ file: h.file, commits: h.commits.length })),
+    previousFindings: previous.length,
+    discussion: null,
+    promptChars: prompt.length,
+  };
 
   return {
     pr,
@@ -218,6 +247,14 @@ export async function buildContext(
     truncated: omitted.length > 0,
     changedLines,
     previous,
-    prompt: parts.join('\n\n'),
+    prompt,
+    evidence,
+  };
+}
+
+export function refsEvidence(issues: LinkedIssue[], prs: LinkedPr[]): Pick<Evidence, 'issues' | 'prs'> {
+  return {
+    issues: issues.map((i) => ({ ref: `${i.repo}#${i.number}`, title: i.title, url: i.url, comments: i.comments.length, linkedBy: i.linkedBy })),
+    prs: prs.map((p) => ({ ref: `${p.repo}#${p.number}`, title: p.title, url: p.url })),
   };
 }

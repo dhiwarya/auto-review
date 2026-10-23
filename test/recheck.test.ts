@@ -264,6 +264,10 @@ describe('re-checking open findings', () => {
     assert.equal(db.findings(earlier.id).find((f) => f.id === minor.id)?.resolved_by_job, job.id);
     assert.equal(db.findings(earlier.id).find((f) => f.id === blocker.id)?.resolved_by_job, null);
     assert.match(prompts[0], /This is intentional, please resolve\./, "the author's reply in the finding's thread is in the prompt");
+    const evidence = db.evidence(job.id);
+    assert.equal(evidence?.diff, null, 'a re-check reads no diff');
+    assert.deepEqual(evidence?.discussion, { threadReplies: 1, conversation: 0 });
+    assert.equal(evidence?.previousFindings, 2);
   });
 
   it('comments when only minors and nits are still open', async () => {

@@ -36,6 +36,14 @@ export interface LinkedIssue {
   body: string;
   url: string;
   comments: { author: string; body: string }[];
+  linkedBy: 'closes' | 'mentioned';
+}
+
+export interface LinkedPr {
+  repo: string;
+  number: number;
+  title: string;
+  url: string;
 }
 
 export async function getPr(gh: GitHub, repo: string, number: number): Promise<PrInfo> {
@@ -126,9 +134,10 @@ export async function compareCommits(gh: GitHub, repo: string, since: string, he
 
 const ISSUE_REF = /(?:^|[\s(,])(?:([\w.-]+\/[\w.-]+))?#(\d+)\b|https:\/\/github\.com\/([\w.-]+\/[\w.-]+)\/issues\/(\d+)/g;
 
-// Issues the PR closes (GitHub's own link), plus issues mentioned in the description.
-export async function getLinkedIssues(gh: GitHub, pr: PrInfo, limit = 5): Promise<LinkedIssue[]> {
-  const refs = new Map<string, { repo: string; number: number }>();
+// Issues the PR closes (GitHub's own link), plus issues and other PRs mentioned in the
+// description. Only issues go into the prompt; the PRs are shown as evidence.
+export async function getLinkedRefs(gh: GitHub, pr: PrInfo, limit = 5): Promise<{ issues: LinkedIssue[]; prs: LinkedPr[] }> {
+  const refs = new Map<string, { repo: string; number: number; linkedBy: LinkedIssue['linkedBy'] }>();
   const { owner, repo: name } = splitRepo(pr.repo);
 
   try {
@@ -145,7 +154,7 @@ export async function getLinkedIssues(gh: GitHub, pr: PrInfo, limit = 5): Promis
       { owner, name, number: pr.number },
     );
     for (const n of res.repository.pullRequest.closingIssuesReferences.nodes) {
-      refs.set(`${n.repository.nameWithOwner}#${n.number}`, { repo: n.repository.nameWithOwner, number: n.number });
+      refs.set(`${n.repository.nameWithOwner}#${n.number}`, { repo: n.repository.nameWithOwner, number: n.number, linkedBy: 'closes' });
     }
   } catch {
     // GraphQL can be unavailable for some tokens; description references still work.
@@ -154,15 +163,20 @@ export async function getLinkedIssues(gh: GitHub, pr: PrInfo, limit = 5): Promis
   for (const m of pr.body.matchAll(ISSUE_REF)) {
     const repo = m[3] ?? m[1] ?? pr.repo;
     const number = Number(m[4] ?? m[2]);
-    if (number && number !== pr.number) refs.set(`${repo}#${number}`, { repo, number });
+    const key = `${repo}#${number}`;
+    if (number && number !== pr.number && !refs.has(key)) refs.set(key, { repo, number, linkedBy: 'mentioned' });
   }
 
   const issues: LinkedIssue[] = [];
+  const prs: LinkedPr[] = [];
   for (const ref of [...refs.values()].slice(0, limit * 2)) {
     if (issues.length >= limit) break;
     try {
       const { data } = await gh.octokit.rest.issues.get({ ...splitRepo(ref.repo), issue_number: ref.number });
-      if (data.pull_request) continue; // a PR reference, not an issue
+      if (data.pull_request) {
+        prs.push({ repo: ref.repo, number: ref.number, title: data.title, url: data.html_url });
+        continue;
+      }
       const { data: comments } = await gh.octokit.rest.issues.listComments({
         ...splitRepo(ref.repo),
         issue_number: ref.number,
@@ -175,10 +189,11 @@ export async function getLinkedIssues(gh: GitHub, pr: PrInfo, limit = 5): Promis
         body: data.body ?? '',
         url: data.html_url,
         comments: comments.map((c) => ({ author: c.user?.login ?? 'unknown', body: c.body ?? '' })),
+        linkedBy: ref.linkedBy,
       });
     } catch {
       // No access to that repo, or the number isn't an issue. Skip it.
     }
   }
-  return issues;
+  return { issues, prs };
 }

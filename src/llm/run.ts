@@ -31,6 +31,8 @@ export function runCli(opts: {
   input: string;
   timeoutMs: number;
   signal?: AbortSignal;
+  // Each complete line of stdout as it arrives, for following a run live.
+  onLine?: (line: string) => void;
 }): Promise<CliResult> {
   return new Promise((resolve, reject) => {
     const started = Date.now();
@@ -38,6 +40,19 @@ export function runCli(opts: {
     let stdout = '';
     let stderr = '';
     let timedOut = false;
+    let partial = '';
+    const feed = (text: string, flush = false) => {
+      if (!opts.onLine) return;
+      const parts = (partial + text).split('\n');
+      partial = flush ? '' : (parts.pop() ?? '');
+      for (const line of parts) {
+        try {
+          if (line.trim()) opts.onLine(line);
+        } catch {
+          // Following along must never break the run itself.
+        }
+      }
+    };
 
     const kill = () => {
       if (child.exitCode === null) child.kill('SIGTERM');
@@ -50,7 +65,11 @@ export function runCli(opts: {
     const onAbort = () => kill();
     opts.signal?.addEventListener('abort', onAbort, { once: true });
 
-    child.stdout?.on('data', (d: Buffer) => (stdout += d.toString()));
+    child.stdout?.on('data', (d: Buffer) => {
+      const text = d.toString();
+      stdout += text;
+      feed(text);
+    });
     child.stderr?.on('data', (d: Buffer) => (stderr += d.toString()));
     child.on('error', (err) => {
       clearTimeout(timer);
@@ -58,6 +77,7 @@ export function runCli(opts: {
       reject(err);
     });
     child.on('close', (code) => {
+      feed('', true);
       clearTimeout(timer);
       opts.signal?.removeEventListener('abort', onAbort);
       resolve({ code, stdout, stderr, durationMs: Date.now() - started, timedOut });

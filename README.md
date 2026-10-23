@@ -173,7 +173,12 @@ Codex runs each command in a read-only, offline sandbox, which needs Linux names
 ## Dashboard
 
 - **Queue:** live progress of running reviews, queued and waiting work, history, and a box to review any allowlisted PR on demand.
-- **Job page:** every finding (including discarded ones and why), the timeline, model runs with their tool calls and tokens, and the review text. In dry run, the review text is what would have been posted.
+- **Job page:** the review from start to end, live while it runs:
+  - **Evidence:** the diff (which files were in the prompt, too long to send, or excluded), linked issues, mentioned PRs, guidelines, file history and the prompt size.
+  - **Code review and security review:** model, time, tokens in and out, tool calls, what each returned, and a step-by-step log of every command, tool call and reasoning note (click one for its output).
+  - **Double-check, checking findings against the code, and posting.**
+
+  Below that: every finding (including discarded ones and why), the timeline and the review text. In dry run, the review text is what would have been posted.
 - **Leaderboard:**
   - **Models:** keep rate per model and pass, refuted findings, findings with bad evidence, speed, failures, and average tool calls and tokens per run.
   - **Repos:** clean-PR rate, findings per PR, blockers, security findings, requirement gaps.

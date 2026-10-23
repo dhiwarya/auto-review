@@ -6,13 +6,13 @@ import type { Db } from '../db.ts';
 import type { Checkout, RepoCache } from '../git/mirror.ts';
 import type { GitHub } from '../github/client.ts';
 import { removeLabel, showLabel } from '../github/labels.ts';
-import { getLinkedIssues, getPr, listDiscussion, listPrFiles, type PrInfo } from '../github/prs.ts';
-import { myVerdict, PendingReviewExists, postReview, type InlineComment, type ReviewEvent } from '../github/publish.ts';
+import { getLinkedRefs, getPr, listDiscussion, listPrFiles, type PrInfo } from '../github/prs.ts';
+import { myVerdict, PendingReviewExists, postReview, SIGNATURE, type InlineComment, type ReviewEvent } from '../github/publish.ts';
 import { NoProviderAvailable, type Router } from '../llm/router.ts';
 import { containsSecret, ownSecrets } from '../secrets.ts';
 import type { Confidence, Finding, Job, PostPreview, Provider, ReviewMode } from '../types.ts';
 import { assess, atLeast, openBlockers } from './confidence.ts';
-import { buildContext, recheckPrompt, type ReviewContext } from './context.ts';
+import { buildContext, recheckPrompt, refsEvidence, type ReviewContext } from './context.ts';
 import { countsLine, inlineBody, recheckBody, summaryBody } from './format.ts';
 import { mainInstructions, recheckInstructions, securityInstructions, verifyInstructions } from './prompts.ts';
 import { RecheckOut, recheckSchema, ReviewOut, reviewSchema, VerifyOut, verifySchema } from './schema.ts';
@@ -71,6 +71,7 @@ export class ReviewPipeline {
       this.step(job, 'Reading the PR, linked issues and guidelines', 18);
       const previous = this.previousFindings(job);
       const ctx = await buildContext(this.gh, this.cfg, pr, job.since_sha, previous, this.cache);
+      this.db.setEvidence(job.id, ctx.evidence);
       this.db.event(
         job.id,
         `${ctx.incremental ? 'Follow-up review of new commits' : 'Full review'}: ${ctx.reviewFiles.length} files, ` +
@@ -243,11 +244,26 @@ export class ReviewPipeline {
         this.step(job, 'Reading what was said on the PR since the last review', 18);
         const owners = new Set(open.map((f) => f.job_id));
         const since = jobs.filter((j) => owners.has(j.id)).map((j) => j.created_at).sort()[0] ?? job.created_at;
-        const [discussion, issues, prFiles] = await Promise.all([
+        const [discussion, { issues, prs }, prFiles] = await Promise.all([
           listDiscussion(this.gh, job.repo, job.pr_number, since),
-          getLinkedIssues(this.gh, pr),
+          getLinkedRefs(this.gh, pr),
           listPrFiles(this.gh, job.repo, job.pr_number),
         ]);
+        const prompt = recheckPrompt(pr, open, discussion, issues);
+        const threads = new Set(open.map((f) => f.comment_id).filter((id) => id !== null));
+        const people = discussion.filter((c) => !c.body.includes(SIGNATURE));
+        this.db.setEvidence(job.id, {
+          diff: null,
+          ...refsEvidence(issues, prs),
+          guidelines: [],
+          history: [],
+          previousFindings: open.length,
+          discussion: {
+            threadReplies: people.filter((c) => c.inReplyTo !== null && threads.has(c.inReplyTo)).length,
+            conversation: people.filter((c) => c.inReplyTo === null).length,
+          },
+          promptChars: prompt.length,
+        });
 
         this.step(job, `Re-checking ${open.length} open finding(s) from earlier reviews`, 30);
         const res = await this.router.run(job.id, 'recheck', {
@@ -256,7 +272,7 @@ export class ReviewPipeline {
           timeoutMs: this.cfg.limits.passTimeoutSec * 1000,
           signal,
           instructions: recheckInstructions(this.gh.me),
-          prompt: recheckPrompt(pr, open, discussion, issues),
+          prompt,
           schema: recheckSchema,
         });
         const parsed = RecheckOut.safeParse(res.output);

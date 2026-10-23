@@ -1,7 +1,7 @@
 import path from 'node:path';
 import { DatabaseSync, type SQLInputValue } from 'node:sqlite';
 import { bus } from './bus.ts';
-import type { Finding, Job, JobEvent, JobState, Run, Severity } from './types.ts';
+import type { Evidence, Finding, Job, JobEvent, JobState, Run, Severity, Step } from './types.ts';
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS jobs (
@@ -106,6 +106,31 @@ CREATE TABLE IF NOT EXISTS events (
 );
 CREATE INDEX IF NOT EXISTS events_job ON events (job_id);
 
+-- What each model run did, written as it happens. detail is the long part (command
+-- output, a tool's result), kept out of listings.
+CREATE TABLE IF NOT EXISTS steps (
+  id INTEGER PRIMARY KEY,
+  job_id INTEGER NOT NULL REFERENCES jobs (id),
+  run_key TEXT NOT NULL,
+  purpose TEXT NOT NULL,
+  provider TEXT NOT NULL,
+  model TEXT,
+  ref TEXT,
+  kind TEXT NOT NULL,
+  title TEXT NOT NULL,
+  detail TEXT,
+  status TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS steps_job ON steps (job_id);
+CREATE INDEX IF NOT EXISTS steps_ref ON steps (run_key, ref);
+
+CREATE TABLE IF NOT EXISTS evidence (
+  job_id INTEGER PRIMARY KEY REFERENCES jobs (id),
+  json TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS kv (
   key TEXT PRIMARY KEY,
   value TEXT
@@ -164,6 +189,9 @@ export class Db {
       ['jobs', 'confidence_notes', 'TEXT'],
       ['jobs', 'approve_note', 'TEXT'],
       ['jobs', 'kind', "TEXT NOT NULL DEFAULT 'review'"],
+      ['runs', 'run_key', 'TEXT'],
+      ['runs', 'prompt_chars', 'INTEGER'],
+      ['runs', 'output', 'TEXT'],
     ];
     for (const [table, column, type] of added) {
       const cols = this.all<{ name: string }>(`PRAGMA table_info(${table})`).map((c) => c.name);
@@ -259,14 +287,56 @@ export class Db {
     return this.all<Finding>('SELECT * FROM findings WHERE job_id = ? ORDER BY id', jobId);
   }
 
-  insertRun(r: Omit<Run, 'id' | 'created_at'>) {
+  insertRun(r: Omit<Run, 'id' | 'created_at' | 'run_key' | 'prompt_chars' | 'output'> & Partial<Pick<Run, 'run_key' | 'prompt_chars' | 'output'>>) {
     this.run(
-      `INSERT INTO runs (job_id, purpose, provider, model, ok, fell_back, duration_ms, error,
-         turns, tool_calls, input_tokens, cached_input_tokens, output_tokens, cost_usd, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      r.job_id, r.purpose, r.provider, r.model, r.ok, r.fell_back, r.duration_ms, r.error,
-      r.turns, r.tool_calls, r.input_tokens, r.cached_input_tokens, r.output_tokens, r.cost_usd, nowIso(),
+      `INSERT INTO runs (job_id, run_key, purpose, provider, model, ok, fell_back, duration_ms, error,
+         turns, tool_calls, input_tokens, cached_input_tokens, output_tokens, cost_usd, prompt_chars, output, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      r.job_id, r.run_key ?? null, r.purpose, r.provider, r.model, r.ok, r.fell_back, r.duration_ms, r.error,
+      r.turns, r.tool_calls, r.input_tokens, r.cached_input_tokens, r.output_tokens, r.cost_usd, r.prompt_chars ?? null,
+      r.output ?? null, nowIso(),
     );
+  }
+
+  // Adds a step, or updates the one with the same ref in this run (a command finishing, a
+  // tool's result arriving). Fields left out of an update keep their value.
+  recordStep(s: Pick<Step, 'job_id' | 'run_key' | 'purpose' | 'provider' | 'model' | 'ref' | 'kind' | 'status'> & { title?: string; detail?: string | null }) {
+    const t = nowIso();
+    const existing = s.ref ? this.get<{ id: number }>('SELECT id FROM steps WHERE run_key = ? AND ref = ?', s.run_key, s.ref) : undefined;
+    if (existing) {
+      this.run(
+        `UPDATE steps SET status = ?, title = COALESCE(?, title), detail = COALESCE(?, detail), updated_at = ? WHERE id = ?`,
+        s.status, s.title ?? null, s.detail ?? null, t, existing.id,
+      );
+      return;
+    }
+    this.run(
+      `INSERT INTO steps (job_id, run_key, purpose, provider, model, ref, kind, title, detail, status, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      s.job_id, s.run_key, s.purpose, s.provider, s.model, s.ref, s.kind, s.title ?? s.kind, s.detail ?? null, s.status, t, t,
+    );
+  }
+
+  // Steps without their detail, which can be long.
+  steps(jobId: number): Step[] {
+    return this.all<Step>(
+      `SELECT id, job_id, run_key, purpose, provider, model, ref, kind, title, status, LENGTH(COALESCE(detail, '')) AS detail_chars,
+         created_at, updated_at FROM steps WHERE job_id = ? ORDER BY id`,
+      jobId,
+    );
+  }
+
+  stepDetail(id: number): string | null {
+    return this.get<{ detail: string | null }>('SELECT detail FROM steps WHERE id = ?', id)?.detail ?? null;
+  }
+
+  setEvidence(jobId: number, evidence: Evidence) {
+    this.run('INSERT INTO evidence (job_id, json) VALUES (?, ?) ON CONFLICT (job_id) DO UPDATE SET json = excluded.json', jobId, JSON.stringify(evidence));
+  }
+
+  evidence(jobId: number): Evidence | null {
+    const row = this.get<{ json: string }>('SELECT json FROM evidence WHERE job_id = ?', jobId);
+    return row ? (JSON.parse(row.json) as Evidence) : null;
   }
 
   runs(jobId: number): Run[] {

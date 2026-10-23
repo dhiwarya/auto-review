@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { Finding, Job, JobDetail, PostPreview, ReviewMode, Severity } from '../../../src/types.ts';
 import { getJson, postJson, sendJson, useStream, useTick } from '../api.ts';
-import { clockTime, compact, duration, Progress, SeverityChip, shortSha, StateBadge, timeAgo } from '../ui.tsx';
+import { clockTime, compact, Progress, SeverityChip, shortSha, StateBadge, timeAgo } from '../ui.tsx';
+import { ProcessView } from './Process.tsx';
 
 const SEV_ORDER: Record<Severity, number> = { blocker: 0, major: 1, minor: 2, nit: 3 };
 
@@ -199,6 +200,12 @@ export function JobView({ id }: { id: number }) {
 
   useEffect(load, [load]);
   useStream((m) => {
+    if (m.type === 'steps' && m.jobId === id) {
+      // A model run did something: refetch, debounced, to show it in the log.
+      if (refetchTimer.current) clearTimeout(refetchTimer.current);
+      refetchTimer.current = window.setTimeout(load, 400);
+      return;
+    }
     if (m.type !== 'job' || m.job.id !== id) return;
     setDetail((d) => (d ? { ...d, job: m.job } : d));
     // Findings and events change alongside the job; refetch them, debounced.
@@ -328,6 +335,11 @@ export function JobView({ id }: { id: number }) {
       </section>
 
       <section>
+        <h2>Process</h2>
+        <ProcessView detail={detail} />
+      </section>
+
+      <section>
         <h2>
           Findings <span className="count">{posted.length}</span>
         </h2>
@@ -346,63 +358,18 @@ export function JobView({ id }: { id: number }) {
         )}
       </section>
 
-      <div className="two-col">
-        <section>
-          <h2>Timeline</h2>
-          <ol className="timeline">
-            {events.map((e) => (
-              <li key={e.id} className={`ev-${e.level}`}>
-                <time dateTime={e.created_at}>{clockTime(e.created_at)}</time>
-                <span>{e.message}</span>
-              </li>
-            ))}
-          </ol>
-        </section>
-        <section>
-          <h2>Model runs</h2>
-          {runs.length ? (
-            <div className="table-wrap">
-              <table className="table">
-                <thead>
-                  <tr>
-                    <th>Pass</th>
-                    <th>Model</th>
-                    <th>Time</th>
-                    <th title="File reads and searches (Claude) or shell commands (Codex). Turns are Claude's model round trips.">Tools</th>
-                    <th title="Tokens in (cached in brackets) / tokens out">Tokens</th>
-                    <th>Result</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {runs.map((r) => (
-                    <tr key={r.id}>
-                      <td>{r.purpose}</td>
-                      <td className="nowrap">
-                        {r.provider}
-                        {r.model ? ` (${r.model})` : ''}
-                        {r.fell_back ? <span className="small muted"> · stand-in</span> : null}
-                      </td>
-                      <td className="nowrap">{duration(r.duration_ms)}</td>
-                      <td className="nowrap" title={r.turns !== null ? `${r.turns} turns` : undefined}>
-                        {r.tool_calls ?? '—'}
-                      </td>
-                      <td className="nowrap" title={r.cost_usd !== null ? `About $${r.cost_usd.toFixed(2)} at API prices (not billed on a subscription)` : undefined}>
-                        {r.input_tokens !== null ? `${compact(r.input_tokens)}${r.cached_input_tokens ? ` (${compact(r.cached_input_tokens)})` : ''} / ${compact(r.output_tokens)}` : '—'}
-                      </td>
-                      <td className={r.ok ? '' : 'error'} title={r.error ?? undefined}>
-                        {r.ok ? 'ok' : (r.error ?? 'failed').slice(0, 60)}
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          ) : (
-            <p className="empty">No model runs yet.</p>
-          )}
-          <p className="small muted">Created {timeAgo(job.created_at)}</p>
-        </section>
-      </div>
+      <section>
+        <h2>Timeline</h2>
+        <ol className="timeline">
+          {events.map((e) => (
+            <li key={e.id} className={`ev-${e.level}`}>
+              <time dateTime={e.created_at}>{clockTime(e.created_at)}</time>
+              <span>{e.message}</span>
+            </li>
+          ))}
+        </ol>
+        <p className="small muted">Created {timeAgo(job.created_at)}</p>
+      </section>
     </div>
   );
 }

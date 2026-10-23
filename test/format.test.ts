@@ -40,8 +40,8 @@ describe('comment format', () => {
 
   it('names linked issues briefly and leaves the requirements line out when not checked', () => {
     const issues = [
-      { repo: 'acme/api', number: 398, url: 'u', title: '', body: '', comments: [] },
-      { repo: 'acme/web', number: 5, url: 'u', title: '', body: '', comments: [] },
+      { repo: 'acme/api', number: 398, url: 'u', title: '', body: '', comments: [], linkedBy: 'mentioned' as const },
+      { repo: 'acme/web', number: 5, url: 'u', title: '', body: '', comments: [], linkedBy: 'mentioned' as const },
     ];
     assert.match(summary({ specStatus: 'partial', specNotes: 'Asks for five retries; does three.', issues }), /\*\*Requirements:\*\* Partly matches #398, acme\/web#5\. Asks for five retries; does three\./);
     assert.doesNotMatch(summary({ specStatus: 'not_checked' }), /Requirements/);
