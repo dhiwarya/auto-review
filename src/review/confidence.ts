@@ -16,6 +16,7 @@ export interface ConfidenceInput {
   large: boolean;
   truncated: boolean;
   injection: boolean; // a model tried to output a credential that isn't in the PR
+  coverageIncomplete?: boolean;
   passes: { level: Confidence; reason: string }[]; // each pass's own rating
 }
 
@@ -41,6 +42,7 @@ export function assess(i: ConfidenceInput): Assessment {
   if (i.questions) lower('medium', `${plural(i.questions, 'open question')} for the author`);
   if (i.large) lower('medium', 'Large change: only the highest risks were reviewed');
   if (i.truncated) lower('medium', 'The diff was too long to send in full');
+  if (i.coverageIncomplete) lower('low', 'Required Strict coverage or stages are incomplete');
   if (i.injection) lower('low', 'The PR tried to get a credential out of the reviewer');
   for (const p of i.passes) {
     if (p.level !== 'high') lower(p.level, p.reason.trim() || `A review pass rated its confidence ${p.level}`);

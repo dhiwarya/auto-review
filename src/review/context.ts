@@ -29,6 +29,7 @@ export interface ReviewContext {
   changedLines: number;
   previous: Finding[];
   prompt: string;
+  contextPrompt?: string; // context without a clipped diff, used by strict review batches
   evidence: Evidence;
 }
 
@@ -154,7 +155,7 @@ export async function buildContext(
         'Review only the changes since then (the diff below), plus whether they fix the previously raised findings.',
     );
   }
-  if (large) {
+  if (large && cfg.reviewProfile !== 'strict') {
     parts.push(
       `This is a large change (${changedLines} changed lines). Report only blocker and major findings, at most 10, ` +
         'and say in the summary that the review focused on the highest risks.',
@@ -196,6 +197,7 @@ export async function buildContext(
     .join('\n');
   parts.push(`## Files in this review (${reviewFiles.length})\n${fileList}`);
 
+  const contextPrompt = parts.join('\n\n');
   let diff = '';
   const omitted: string[] = [];
   for (const f of included) {
@@ -239,7 +241,7 @@ export async function buildContext(
     pr,
     me: gh.me,
     prFiles,
-    reviewFiles,
+    reviewFiles: promptFiles,
     excluded,
     issues,
     incremental,
@@ -248,6 +250,7 @@ export async function buildContext(
     changedLines,
     previous,
     prompt,
+    contextPrompt,
     evidence,
   };
 }

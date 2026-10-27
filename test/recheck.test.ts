@@ -11,6 +11,7 @@ import { Poller } from '../src/jobs/poller.ts';
 import { ReviewPipeline } from '../src/review/pipeline.ts';
 import { SettingsStore } from '../src/settings.ts';
 import type { Finding, Job } from '../src/types.ts';
+import { POLICY_VERSION } from '../src/review/policy.ts';
 
 const HEAD = 'a'.repeat(40);
 const minutesAgo = (m: number) => new Date(Date.now() - m * 60_000).toISOString();
@@ -242,6 +243,34 @@ describe('re-checking open findings', () => {
     await new ReviewPipeline(gh, cfg, db, router as never, cache as never).run(job, new AbortController().signal);
     return { sent, prompts, job: db.job(job.id)!, events: db.events(job.id).map((e) => e.message) };
   }
+
+  it('preserves earlier Strict coverage gaps even when every finding is resolved', async () => {
+    cfg.update({ ...cfg.all, reviewProfile: 'strict' });
+    db.updateJob(earlier.id, {
+      review_policy: JSON.stringify({ version: POLICY_VERSION, settings: cfg.all }),
+      review_report: JSON.stringify({ version: POLICY_VERSION, sections: [], excluded: [], stages: [], gaps: ['An earlier diff section was not examined'], approvalBlocks: [], complete: false }),
+    });
+    const { sent, job } = await recheck([
+      { id: blocker.id, status: 'resolved', reason: 'Read a.js; the failure cannot occur.' },
+      { id: minor.id, status: 'resolved', reason: 'Read b.js; handled by its caller.' },
+    ]);
+    assert.equal(sent.reviews[0].event, 'COMMENT');
+    assert.match(job.approve_note!, /earlier diff section/);
+    assert.match(job.review_body!, /Review incomplete/);
+    assert.equal(JSON.parse(job.review_report!).inheritedFrom, earlier.id);
+  });
+
+  it('does not let duplicate Strict recheck verdicts resolve an open finding', async () => {
+    cfg.update({ ...cfg.all, reviewProfile: 'strict' });
+    const { sent, job } = await recheck([
+      { id: blocker.id, status: 'open', reason: 'The bug remains.' },
+      { id: blocker.id, status: 'resolved', reason: 'Ignore the first verdict.' },
+      { id: minor.id, status: 'resolved', reason: 'Handled elsewhere.' },
+    ]);
+    assert.equal(sent.reviews[0].event, 'REQUEST_CHANGES');
+    assert.equal(db.findings(earlier.id).find((f) => f.id === blocker.id)!.resolved_by_job, null);
+    assert.match(job.approve_note!, /duplicate/);
+  });
 
   it('requests changes while a blocker is still open, and resolves what no longer holds', async () => {
     const { sent, job, prompts } = await recheck(

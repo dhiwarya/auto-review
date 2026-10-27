@@ -63,7 +63,7 @@ function Verdict({ job }: { job: Job }) {
   else if (job.review_state === 'CHANGES_REQUESTED') outcome = `Changes requested${job.approve_note ? `: ${job.approve_note}` : ''}`;
   else if (job.dry_run) outcome = null;
   else if (job.approve_note) outcome = `Not approved: ${job.approve_note}`;
-  else if (job.mode === 'draft' && job.review_state === 'PENDING') outcome = 'No blockers: you can approve it when you submit the draft';
+  else if (job.mode === 'draft' && job.review_state === 'PENDING') outcome = 'Approval checks passed: you can approve it when you submit the draft';
   return (
     <div className="small meta-line">
       <span>
@@ -290,6 +290,7 @@ export function JobView({ id }: { id: number }) {
         {job.state === 'skipped' && <div className="small muted">{job.skip_reason}</div>}
 
         <div className="actions">
+          {!active && <button className="btn btn-ghost" onClick={() => postJson<{ id: number }>(`/api/jobs/${id}/full-review`).then((j) => { window.location.hash = `#/jobs/${j.id}`; }).catch((e) => setRecheckError(String(e.message ?? e)))} title="Review the entire current PR using the current profile and fresh budgets">Full PR review</button>}
           {job.dry_run === 1 && job.state === 'done' && job.review_state === 'DRY_RUN' && !showPost && (
             <button className="btn" onClick={() => setShowPost(true)}>
               Post to GitHub…

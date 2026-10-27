@@ -7,7 +7,7 @@ import type { Finding, Severity, SpecStatus } from '../types.ts';
 const SEVERITY_LABEL: Record<Severity, string> = { blocker: 'Blocker', major: 'Major', minor: 'Minor', nit: 'Nit' };
 const SEVERITIES: Severity[] = ['blocker', 'major', 'minor', 'nit'];
 
-const heading = (f: Finding) => `**${SEVERITY_LABEL[f.severity]} (${f.category}):** ${f.title}`;
+const heading = (f: Finding) => `**${f.confidence === 'low' && (f.verification === 'uncertain' || f.verification === 'skipped') ? 'Unverified concern · ' : ''}${SEVERITY_LABEL[f.severity]} (${f.category}):** ${f.title}`;
 const oneLine = (text: string) => text.replace(/\s*\n+\s*/g, ' ').trim();
 
 export function inlineBody(f: Finding): string {

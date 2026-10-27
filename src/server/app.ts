@@ -35,7 +35,7 @@ export function overview({ cfg, db, gh, router, worker, poller }: Deps): Overvie
   return {
     me: gh.me,
     github_auth: gh.authSource,
-    settings: { provider: cfg.models.provider, fallbackToOther: cfg.models.fallbackToOther, doubleCheck: cfg.models.doubleCheck },
+    settings: { profile: cfg.reviewProfile, provider: cfg.models.provider, fallbackToOther: cfg.models.fallbackToOther, doubleCheck: cfg.models.doubleCheck },
     needs_setup: cfg.needsSetup,
     dry_run: cfg.dryRun,
     default_mode: cfg.defaultMode,
@@ -125,6 +125,11 @@ export async function startServer(deps: Deps) {
     } catch (err) {
       return reply.code(409).send({ error: err instanceof Error ? err.message : String(err) });
     }
+  });
+
+  app.post<{ Params: { id: string } }>('/api/jobs/:id/full-review', async (req, reply) => {
+    try { return await poller.fullReviewFromDashboard(Number(req.params.id)); }
+    catch (err) { return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) }); }
   });
 
   app.post<{ Params: { id: string } }>('/api/jobs/:id/cancel', async (req) => {

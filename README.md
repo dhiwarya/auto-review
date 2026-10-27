@@ -4,7 +4,7 @@ A personal review agent that runs on your own machine. When someone requests you
 
 ## What a review covers
 
-One provider does the whole review: **Codex** by default (Sol 6.1, then Sol 6), with **Claude** taking over only if Codex runs out (Opus 5.5, then Opus 4.8). You can switch providers, or turn the fallback off, on the dashboard's Settings page.
+The **Standard** profile uses one provider for the review: **Codex** by default (Sol 6.1, then Sol 6), with **Claude** taking over only if Codex runs out (Opus 5.5, then Opus 4.8). You can switch providers, or turn the fallback off, on the dashboard's Settings page. The **Strict** profile requires both providers, as described below.
 
 Security reviews can trip a provider's safety filter (OpenAI may flag one as "possible cybersecurity risk"). That run then goes to the next model in the same order, ending with Claude if the fallback is on. Nothing is paused, since the refusal is about that PR, not the model. The security instructions say plainly that this is a defensive review of the team's own code, and never ask for exploit code or payloads.
 
@@ -23,6 +23,33 @@ After that, plain code (no model) checks each finding:
 - Any credential in the output is redacted. If a credential appears that the PR itself didn't add, the finding is dropped as a possible exfiltration attempt.
 
 Severity scale: **blocker**, **major**, **minor**, **nit**.
+
+### Strict reviews
+
+Select **Settings → Reviewer → Review profile → Strict**. Standard remains the default for existing and new installations. Selecting Strict does not change dry run, draft/publish mode, or the repository list. Both Codex and Claude CLI logins are required.
+
+Strict reviews run code/requirements and security passes on the primary provider, then a fresh adversarial pass on the other provider. The independent pass does not see the current review's other findings. Serious findings are verified in fresh runs on the provider opposite the one that raised them. Model fallback stays within the assigned provider; the Standard cross-provider fallback switch does not weaken this requirement.
+
+The reviewer creates a manifest of diff sections. Every required pass must account for each assigned section and report the dependencies, tests and configuration it examined. Claimed file paths must exist inside the checkout. Large changes are split into bounded batches, followed by a synthesis pass checking interactions across batches. Real minor findings are still included; the Standard large-PR top-risk restriction does not apply. Strict evidence must match a complete quoted block, allowing indentation differences. Requirement findings can instead quote actual linked-issue evidence.
+
+The job page distinguishes diffs included in a prompt, the model's reported examination, and its recorded tool activity. Coverage reports are evidence of the review process, not proof that a model understood the code. Exclusions stay visible. Missing sections, truncated context, exhausted budgets, or failed stages make the review incomplete and prevent approval.
+
+| Strict budget | Default |
+| --- | --- |
+| Time per model run | 1,800 seconds |
+| Characters per run, including context and an instruction allowance | 500,000 |
+| Review batches | 8 |
+| Model attempts per job, including verification and model fallbacks | 32 |
+| Claude turns per run | 120 |
+| Claude effort | High |
+
+Successful, schema-valid stages are saved under their exact input fingerprint. After an unavailable provider recovers, only missing stages run again. Other stage failures use the normal bounded job retries. Exhausted budgets require a new full review with suitable settings. Repeated calls count against the total job attempt budget, including calls from earlier attempts.
+
+Strict approval always requires high confidence, complete required stages and coverage, no open blocker or major from any review, no unresolved serious verification, no material requirement gaps, and no unresolved review questions. The existing commit, draft-PR, self-approval, manual-change-request and credential checks still apply. The preview and actual post use the same decision. A failed verifier never silently qualifies a Strict review for approval. Uncertain serious concerns retain their severity and appear as clearly marked summary items for human inspection.
+
+Each started job stores its review profile, policy version and effective settings. Retries retain that policy. More restrictive current approval settings also apply at posting; changing to Standard cannot remove a started Strict job's gates. Draft submission remains your decision. Strict adds no new automatic request-changes behavior to initial reviews.
+
+Incremental reviews require a complete, high-confidence Strict baseline before they can approve. Rechecks preserve earlier coverage gaps; resolving findings does not fill those gaps. Use **Full PR review** on the job page to review the entire current PR with the current profile and fresh budgets. This is also how to establish Strict coverage for an earlier Standard review. If you already have a pending GitHub review, submit or discard it before another can be posted.
 
 ## Lifecycle
 
@@ -188,7 +215,7 @@ The keep rate is learned automatically. After you submit a draft, the app checks
 
 ## Settings
 
-Everything is set on the dashboard's **Settings** page and stored in the app's database (`data/reviewer.sqlite`). A save is checked as a whole and applies straight away, with no restart. Defaults:
+Everything is set on the dashboard's **Settings** page and stored in the app's database (`data/reviewer.sqlite`). A save is checked as a whole and applies without a restart. Review policies are captured when a job starts; model and review-budget changes apply to new jobs, while stricter approval restrictions also apply before posting. Defaults:
 
 | Section | Setting | Default |
 | --- | --- | --- |
@@ -197,6 +224,7 @@ Everything is set on the dashboard's **Settings** page and stored in the app's d
 | | How reviews are posted | Draft, with optional exceptions per repo |
 | | Approve PRs that have no blockers | On, when confidence is at least high |
 | Reviewer | Who reviews | Codex |
+| | Review profile | Standard; select Strict for independent review and required coverage |
 | | If Codex runs out, use Claude instead | On |
 | | Double-check blockers and majors | On |
 | | Codex models | `gpt-6.1-sol`, then `gpt-6-sol` |
@@ -242,10 +270,15 @@ That saves GitHub requests and gives the reviewer history to work with. The copi
 | --- | --- |
 | `npm run dev` | API with auto-reload on port 4477 |
 | `npm run dev:web` | Dashboard with hot reload on port 5173 (proxies to the API) |
-| `npm test` | Unit tests for diff parsing and finding validation |
+| `npm test` | Tests for validation, review workflows, approval gates, routing, persistence and Strict coverage |
 | `npm run typecheck` | Type-check the API and the dashboard |
+| `npm run eval:strict -- results.json` | Compare human-adjudicated fixture reviews by profile |
 
 The server runs TypeScript directly through Node's type stripping, so it has no build step. Only the dashboard is built, with Vite. State lives in `data/reviewer.sqlite`, using Node's built-in SQLite.
+
+For environments that restrict the test runner's child processes, use `node --test --test-isolation=none test/*.test.ts`. The POSIX git-remote and shell-stand-in suites remain explicitly skipped on Windows.
+
+Quality evaluation fixtures live in `test/fixtures/strict-reviews.json`. Run both profiles against the same fixtures, then have a human match each finding to an expected defect (or label it a false positive). Supply a JSON object with a `reviews` array. Each row has `caseId`, `profile` (`standard` or `strict`), `complete`, `durationMs`, nullable `inputTokens`/`outputTokens`, and `findings: [{ "matchedExpectedId": "expected-defect-id-or-null" }]` (use JSON `null` for a false positive). The evaluation command reports precision, recall, duplicates, incomplete runs, missing cases, runtime and token usage. These small synthetic fixtures support repeatable comparisons; mock-provider workflow tests do not establish real-model detection quality.
 
 ## Known limits
 

@@ -27,6 +27,8 @@ export interface PlaceOptions {
   prFiles: PrFile[];
   previous: Pick<Finding, 'file' | 'line' | 'title'>[];
   maxNits: number;
+  strict?: boolean;
+  requirementText?: string;
 }
 
 const SEVERITY_RANK: Record<Severity, number> = { blocker: 0, major: 1, minor: 2, nit: 3 };
@@ -96,9 +98,15 @@ function readInside(checkoutDir: string, file: string): string | null {
   }
 }
 
-function evidenceFound(evidence: string, content: string | null, patch: ParsedPatch | null): boolean {
+function evidenceFound(evidence: string, content: string | null, patch: ParsedPatch | null, strict = false): boolean {
   const lines = evidenceLines(evidence);
   if (!lines.length) return false;
+  if (strict) {
+    // Match a contiguous block, allowing indentation differences but no missing quoted lines.
+    const normalize = (text: string) => text.split('\n').map((l) => l.trim()).filter(Boolean).join('\n');
+    const quote = lines.join('\n');
+    return `\n${normalize(content ?? '')}\n`.includes(`\n${quote}\n`) || `\n${normalize((patch?.removedText ?? []).join('\n'))}\n`.includes(`\n${quote}\n`);
+  }
   const haystack = new Set<string>();
   for (const l of (content ?? '').split('\n')) haystack.add(l.trim());
   for (const l of patch?.removedText ?? []) haystack.add(l.trim());
@@ -143,8 +151,9 @@ export function placeFindings(candidates: Candidate[], opts: PlaceOptions): Plac
 
     const prFile = prFileByName.get(c.file);
     const content = c.file ? readInside(opts.checkoutDir, c.file) : null;
+    const requirementEvidence = c.category === 'requirement' && opts.strict && evidenceFound(c.evidence, opts.requirementText ?? '', null, true);
     if (!prFile && content === null) {
-      return c.category === 'requirement' && !c.file ? scrub({ ...c, status: 'summary' }) : drop(`file not found: ${c.file || '(none)'}`);
+      return c.category === 'requirement' && !c.file && (!opts.strict || requirementEvidence) ? scrub({ ...c, status: 'summary' }) : drop(`file not found or requirement evidence unsupported: ${c.file || '(none)'}`);
     }
 
     let patch: ParsedPatch | null = null;
@@ -153,8 +162,8 @@ export function placeFindings(candidates: Candidate[], opts: PlaceOptions): Plac
       patches.set(prFile.filename, patch);
     }
 
-    if (!evidenceFound(c.evidence, content, patch)) {
-      if (c.category === 'requirement') return scrub({ ...c, status: 'summary' });
+    if (!evidenceFound(c.evidence, content, patch, opts.strict)) {
+      if (c.category === 'requirement' && (!opts.strict || requirementEvidence)) return scrub({ ...c, status: 'summary' });
       return drop('quoted evidence not found in the file');
     }
 

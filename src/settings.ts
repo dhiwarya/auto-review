@@ -24,10 +24,10 @@ export class SettingsStore {
   private deny: Matcher = never;
   private excluded: Matcher = never;
 
-  constructor(db: Db) {
+  constructor(db: Db, snapshot?: Settings) {
     this.db = db;
     this.data = SettingsStore.defaults();
-    const raw = db.getKv(KEY);
+    const raw = snapshot ? JSON.stringify(snapshot) : db.getKv(KEY);
     if (raw) {
       const parsed = SettingsSchema.safeParse(JSON.parse(raw));
       if (parsed.success) this.data = parsed.data;
@@ -42,6 +42,10 @@ export class SettingsStore {
 
   get all(): Settings {
     return structuredClone(this.data);
+  }
+
+  snapshot(data = this.all): SettingsStore {
+    return new SettingsStore(this.db, data);
   }
 
   get stored(): boolean {
@@ -94,6 +98,8 @@ export class SettingsStore {
   // ---- sections, read live
 
   get repos() { return this.data.repos; }
+  get reviewProfile() { return this.data.reviewProfile; }
+  get strict() { return this.data.strict; }
   get dryRun() { return this.data.dryRun; }
   get defaultMode() { return this.data.defaultMode; }
   get skipAuthors() { return this.data.skipAuthors; }

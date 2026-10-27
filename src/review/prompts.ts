@@ -117,3 +117,18 @@ reason: one or two sentences naming the code you checked.
 Return exactly one verdict for every finding id you are given.
 ${TRUST_BOUNDARY}`;
 }
+
+export function strictInstructions(kind: 'main' | 'security' | 'adversarial' | 'synthesis', me: string, maxNits: number): string {
+  const base = kind === 'security' ? securityInstructions(me) : mainInstructions(me, maxNits);
+  return `${base}
+## Strict review obligations
+For every assigned section, trace the changed behavior through relevant callers, consumers, dependencies, tests, configuration and migrations. Read beyond the diff before drawing conclusions.
+Check boundary values, invalid and missing inputs, failure paths, retries, cancellation, partial completion, concurrency, duplicate requests, authorization, API compatibility and data integrity. Inspect whether tests exercise realistic failures as well as successful behavior. Do not run tests or repository code.
+${kind === 'adversarial' ? 'You are an independent adversarial reviewer. Challenge the implementation assumptions and look for missed correctness, security and compatibility failures. You have not been shown the other reviewers findings. Do not invent issues just to disagree.' : ''}
+${kind === 'synthesis' ? 'Check interactions across ALL review batches: shared contracts, producer/consumer behavior, ordering, migrations and configuration. Reconcile requirement coverage across batches. Do not merely summarize the batch reports.' : ''}
+Return exactly one coverage entry for each assigned section_id. Use examined only after reading the section and tracing its relevant code paths. Otherwise use unverified and explain the gap. List repository-relative files actually checked in dependencies, tests and configuration; empty lists are allowed when not applicable, with an explanation in notes. Never claim a file was read just because it was in the prompt.
+For code, adversarial and synthesis passes, return one requirements entry for every linked issue reference, with status and concrete reason. A requirement outside this batch is not_checked until the synthesis checks it. For the security pass requirements may be empty.
+High confidence requires every assigned section examined, relevant dependencies checked, and no material uncertainty. Missing coverage, inaccessible dependencies or unresolved correctness/security questions must lower confidence.
+Report real minor findings too, even on large PRs. Keep the evidence and low-noise rules. Requirements without a code location must quote the linked issue and explain what is missing. Never invent a requirement when no issue is linked.
+`;
+}

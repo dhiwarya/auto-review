@@ -192,6 +192,8 @@ export class Db {
       ['runs', 'run_key', 'TEXT'],
       ['runs', 'prompt_chars', 'INTEGER'],
       ['runs', 'output', 'TEXT'],
+      ['jobs', 'review_policy', 'TEXT'],
+      ['jobs', 'review_report', 'TEXT'],
     ];
     for (const [table, column, type] of added) {
       const cols = this.all<{ name: string }>(`PRAGMA table_info(${table})`).map((c) => c.name);

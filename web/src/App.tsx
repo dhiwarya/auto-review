@@ -21,8 +21,8 @@ function useHashRoute(): string[] {
   return route;
 }
 
-function ProviderPill({ p, backup }: { p: ProviderStatus; backup?: boolean }) {
-  const name = `${p.provider === 'claude' ? 'Claude' : 'Codex'}${backup ? ' (backup)' : ''}`;
+function ProviderPill({ p, role }: { p: ProviderStatus; role?: string }) {
+  const name = `${p.provider === 'claude' ? 'Claude' : 'Codex'}${role ? ` (${role})` : ''}`;
   const blocked = p.blocked_until !== null;
   const auth = p.last_error?.startsWith('auth') || p.last_error?.startsWith('missing');
   const first = p.models[0]?.model ?? null;
@@ -48,11 +48,12 @@ function Providers({ overview }: { overview: Overview }) {
   const { provider, fallbackToOther } = overview.settings;
   const primary = overview.providers.find((p) => p.provider === provider);
   const backup = overview.providers.find((p) => p.provider !== provider);
-  const showBackup = fallbackToOther && backup && (primary?.blocked_until || backup.blocked_until);
+  const strict = overview.settings.profile === 'strict';
+  const showBackup = backup && (strict || (fallbackToOther && (primary?.blocked_until || backup.blocked_until)));
   return (
     <>
       {primary && <ProviderPill p={primary} />}
-      {showBackup && <ProviderPill p={backup} backup />}
+      {showBackup && <ProviderPill p={backup!} role={strict ? 'independent' : 'backup'} />}
     </>
   );
 }

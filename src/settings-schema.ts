@@ -25,6 +25,15 @@ const providerModels = z.object({
 });
 
 export const SettingsSchema = z.object({
+  reviewProfile: z.enum(['standard', 'strict']).default('standard'),
+  strict: z.object({
+    passTimeoutSec: int(60, 3600).default(1800),
+    maxDiffChars: int(10_000, 1_000_000).default(500_000),
+    claudeMaxTurns: int(5, 200).default(120),
+    claudeEffort: z.enum(['low', 'medium', 'high', 'xhigh', 'max']).default('high'),
+    maxBatches: int(1, 40).default(8),
+    maxRuns: int(3, 200).default(32),
+  }).prefault({}),
   // Nothing outside this list is ever reviewed. Empty until you add repos in Settings.
   repos: z
     .object({

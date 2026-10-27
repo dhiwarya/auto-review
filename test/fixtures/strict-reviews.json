@@ -1,0 +1,38 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "id": "guarded-limit",
+      "description": "A validated limit with a safe lower bound; avoid speculative findings.",
+      "files": { "limit.js": "export const take = (items, limit) => items.slice(0, Math.max(1, limit));" },
+      "expected": []
+    },
+    {
+      "id": "zero-limit",
+      "description": "A changed default silently drops every result.",
+      "files": { "limit.js": "export const take = (items, limit = 0) => items.slice(0, limit);" },
+      "expected": [{ "id": "empty-default-results", "explanation": "Calling take with nonempty items and no limit always returns an empty array." }]
+    },
+    {
+      "id": "cross-file-authorization",
+      "description": "Trace a route through its data-access helper.",
+      "files": {
+        "route.js": "import { loadInvoice } from './store.js'; export const invoice = (req) => loadInvoice(req.params.id);",
+        "store.js": "export const loadInvoice = (id) => db.invoice.findUnique({ where: { id } });"
+      },
+      "expected": [{ "id": "missing-tenant-check", "explanation": "The route and helper never constrain invoice access to the authenticated tenant." }]
+    },
+    {
+      "id": "retry-side-effect",
+      "description": "Trace retry behavior around a non-idempotent operation.",
+      "files": { "checkout.js": "export async function checkout(client, cart) { try { return await client.charge(cart); } catch { return await client.charge(cart); } }" },
+      "expected": [{ "id": "duplicate-charge", "explanation": "A lost response after a successful charge triggers a second charge without an idempotency key." }]
+    },
+    {
+      "id": "unsafe-migration",
+      "description": "Check existing rows and deployment compatibility.",
+      "files": { "migration.sql": "ALTER TABLE accounts ADD COLUMN region TEXT NOT NULL;" },
+      "expected": [{ "id": "existing-rows-migration", "explanation": "On PostgreSQL with existing account rows, adding a non-null column without a default or backfill fails." }]
+    }
+  ]
+}

@@ -6,6 +6,7 @@ import { NoProviderAvailable } from '../llm/router.ts';
 import { JobObsolete, UnsafeToPost, type ReviewPipeline } from '../review/pipeline.ts';
 import { bus } from '../bus.ts';
 import type { Job } from '../types.ts';
+import { StrictReviewWaiting } from '../review/strict.ts';
 
 const minutesFromNow = (m: number) => new Date(Date.now() + m * 60_000).toISOString();
 
@@ -58,7 +59,7 @@ export class Worker {
       return `Paused between ${this.cfg.schedule.pauseBetween!.start} and ${this.cfg.schedule.pauseBetween!.end}`;
     }
     const hourAgo = new Date(Date.now() - 3600_000).toISOString();
-    const started = this.db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM runs WHERE purpose IN ('main', 'recheck') AND created_at >= ?`, hourAgo)?.n ?? 0;
+    const started = this.db.get<{ n: number }>(`SELECT COUNT(DISTINCT job_id) AS n FROM runs WHERE (purpose IN ('main', 'recheck') OR purpose LIKE 'strict:%') AND created_at >= ?`, hourAgo)?.n ?? 0;
     if (started >= this.cfg.schedule.maxReviewsPerHour) return `Hourly limit reached (${this.cfg.schedule.maxReviewsPerHour} reviews per hour)`;
     return null;
   }
@@ -111,6 +112,11 @@ export class Worker {
       this.db.event(id, message, 'error');
       this.db.setState(id, 'failed', { error: message, step: 'Failed' });
       await this.pipeline.labelFailed(job).catch(() => {});
+      return;
+    }
+    if (err instanceof StrictReviewWaiting) {
+      this.db.event(id, err.message, 'warn');
+      this.db.setState(id, 'waiting', { step: err.message, next_attempt_at: err.retryAt.toISOString() });
       return;
     }
     if (err instanceof NoProviderAvailable) {

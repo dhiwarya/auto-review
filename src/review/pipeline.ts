@@ -17,6 +17,8 @@ import { countsLine, inlineBody, recheckBody, summaryBody } from './format.ts';
 import { mainInstructions, recheckInstructions, securityInstructions, verifyInstructions } from './prompts.ts';
 import { RecheckOut, recheckSchema, ReviewOut, reviewSchema, VerifyOut, verifySchema } from './schema.ts';
 import { addedTextOf, lowerSeverity, minSeverity, placeFindings, scrubText, type Candidate } from './validate.ts';
+import { POLICY_VERSION, readPolicy, readReport, strictApprovalBlocks } from './policy.ts';
+import { runStrictReview, StrictReviewWaiting } from './strict.ts';
 
 // The job no longer needs doing: PR closed, or new commits replaced it.
 export class JobObsolete extends Error {}
@@ -53,43 +55,61 @@ export class ReviewPipeline {
     if (pr.state !== 'open') throw new JobObsolete('PR is no longer open');
     if (pr.headSha !== job.head_sha) throw new JobObsolete(`superseded by new commits (${pr.headSha.slice(0, 7)})`);
     this.db.updateJob(job.id, { pr_title: pr.title, additions: pr.additions, deletions: pr.deletions, changed_files: pr.changedFiles });
+    if (!job.review_policy) job = this.db.updateJob(job.id, { review_policy: JSON.stringify({ version: POLICY_VERSION, settings: this.cfg.all }) });
+    const policy = readPolicy(job);
+    if (!policy) throw new Error('Unknown review policy; this job cannot be resumed safely');
+    const frozen = structuredClone(policy.settings);
+    const strict = frozen.reviewProfile === 'strict';
+    if (strict) {
+      frozen.limits.passTimeoutSec = frozen.strict.passTimeoutSec;
+      frozen.limits.maxDiffChars = frozen.strict.maxDiffChars;
+      frozen.limits.claudeMaxTurns = frozen.strict.claudeMaxTurns;
+      frozen.models.claudeEffort = frozen.strict.claudeEffort;
+    }
+    const cfg = this.cfg.snapshot(frozen);
 
     // A retry after "pending review exists" only needs to post what was already prepared.
-    if (job.review_body && !job.review_id && !job.dry_run) {
+    if (job.review_body && !job.review_id && !job.dry_run && (!strict || readReport(job)?.complete)) {
       await this.publish(job, this.db.findings(job.id));
       return;
     }
+    if (strict) this.db.run('UPDATE findings SET resolved_by_job = NULL WHERE resolved_by_job = ?', job.id);
 
     await this.labelStart(job, pr);
-    if (job.kind === 'recheck') return this.recheck(job, pr, signal);
+    if (job.kind === 'recheck') return this.recheck(job, pr, signal, cfg);
 
     const workDir = await fs.mkdtemp(path.join(os.tmpdir(), `auto-reviewer-work-${job.id}-`));
     let checkout: Checkout | null = null;
     try {
-      checkout = await this.checkout(job, pr, signal);
+      checkout = await this.checkout(job, pr, signal, cfg);
 
       this.step(job, 'Reading the PR, linked issues and guidelines', 18);
       const previous = this.previousFindings(job);
-      const ctx = await buildContext(this.gh, this.cfg, pr, job.since_sha, previous, this.cache);
+      const ctx = await buildContext(this.gh, cfg, pr, job.since_sha, previous, this.cache);
       this.db.setEvidence(job.id, ctx.evidence);
       this.db.event(
         job.id,
         `${ctx.incremental ? 'Follow-up review of new commits' : 'Full review'}: ${ctx.reviewFiles.length} files, ` +
-          `${ctx.changedLines} changed lines, ${ctx.issues.length} linked issue(s)${ctx.large ? ', large-PR mode' : ''}`,
+          `${ctx.changedLines} changed lines, ${ctx.issues.length} linked issue(s)${ctx.large ? strict ? ', Strict batch review' : ', large-PR mode' : ''}`,
       );
 
-      const task = { cwd: checkout.dir, workDir, timeoutMs: this.cfg.limits.passTimeoutSec * 1000, signal };
+      const task = { cwd: checkout.dir, workDir, timeoutMs: cfg.limits.passTimeoutSec * 1000, signal };
+      const placeOpts = { checkoutDir: checkout.dir, prFiles: ctx.prFiles, previous, maxNits: cfg.limits.maxNits, strict, requirementText: ctx.issues.map((i) => `${i.title}\n${i.body}\n${i.comments.map((c) => c.body).join('\n')}`).join('\n') };
       this.step(job, 'Reviewing: code and requirements, security', 25);
+      const strictResult = strict ? await runStrictReview({ job, ctx, cfg, db: this.db, router: this.router, task, placeOpts }) : null;
       let done = 0;
       const progress = () => this.db.updateJob(job.id, { progress: 25 + ++done * 22 });
-      const [main, security] = await Promise.all([
+      const [main, security] = strictResult ? [
+        { provider: cfg.models.provider, model: cfg.models[cfg.models.provider].model, output: strictResult.mainOut },
+        { provider: cfg.models.provider, model: cfg.models[cfg.models.provider].model, output: { summary: '', findings: [], questions_for_author: [], resolved_previous_ids: [], spec_alignment: { status: 'not_checked', notes: '' }, review_confidence: { level: 'high', reason: '' } } },
+      ] : await Promise.all([
         this.router
           .run(job.id, 'main', {
             ...task,
-            instructions: mainInstructions(ctx.me, this.cfg.limits.maxNits),
+            instructions: mainInstructions(ctx.me, cfg.limits.maxNits),
             prompt: ctx.prompt,
             schema: reviewSchema,
-          })
+          }, { config: cfg })
           .finally(progress),
         this.router
           .run(job.id, 'security', {
@@ -97,27 +117,32 @@ export class ReviewPipeline {
             instructions: securityInstructions(ctx.me),
             prompt: ctx.prompt,
             schema: reviewSchema,
-          })
+          }, { config: cfg })
           .finally(progress),
       ]);
       const mainOut = parseReview(main.output, 'main');
       const secOut = parseReview(security.output, 'security');
       const label = (r: { provider: string; model: string | null }) => `${r.provider} ${r.model ?? '(default model)'}`;
-      this.db.event(job.id, `Main pass (${label(main)}): ${mainOut.findings.length} finding(s). Security pass (${label(security)}): ${secOut.findings.length} finding(s).`);
+      this.db.event(job.id, strictResult ? `Strict review: ${strictResult.report.stages.length} stages, ${strictResult.candidates.length} proposed finding(s), ${strictResult.report.complete ? 'coverage complete' : 'incomplete'}` : `Main pass (${label(main)}): ${mainOut.findings.length} finding(s). Security pass (${label(security)}): ${secOut.findings.length} finding(s).`);
 
-      let candidates: Candidate[] = [
+      let candidates: Candidate[] = strictResult?.candidates ?? [
         ...mainOut.findings.map((f) => toCandidate(f, 'main', main.provider, main.model)),
         ...secOut.findings.map((f) => toCandidate(f, 'security', security.provider, security.model)),
       ];
 
-      const placeOpts = { checkoutDir: checkout.dir, prFiles: ctx.prFiles, previous, maxNits: this.cfg.limits.maxNits };
-      if (this.cfg.models.doubleCheck && candidates.some((c) => c.severity === 'blocker' || c.severity === 'major')) {
+      if (!strict && cfg.models.doubleCheck && candidates.some((c) => c.severity === 'blocker' || c.severity === 'major')) {
         this.step(job, 'Double-checking blockers and majors', 72);
-        candidates = await this.verify(job, ctx, candidates, placeOpts, task);
+        candidates = await this.verify(job, ctx, candidates, placeOpts, task, cfg);
       }
 
       this.step(job, 'Checking findings against the code', 88);
       const placed = placeFindings(candidates, placeOpts);
+      if (strict) {
+        // Retried Strict stages are checkpointed. Replace their local materialization so
+        // a resumed job never accumulates duplicate findings.
+        this.db.run('DELETE FROM findings WHERE job_id = ?', job.id);
+        for (const p of placed) if (p.status !== 'dropped' && (p.original_severity === 'blocker' || p.original_severity === 'major') && p.verification !== 'confirmed') p.status = 'summary';
+      }
       const inserted = placed.map((p) =>
         this.db.insertFinding({
           job_id: job.id,
@@ -156,14 +181,15 @@ export class ReviewPipeline {
       const posted = inserted.filter((f) => f.status !== 'dropped');
       // Free text is posted as written, so it gets the same secret check as the findings.
       const addedText = addedTextOf(ctx.prFiles);
-      let smuggled = false;
+      let smuggled = strictResult?.injection ?? false;
       const clean = (text: string) => {
         const scrubbed = scrubText(text, addedText);
         smuggled ||= scrubbed.smuggled;
         return scrubbed.text;
       };
       const summaries = [clean(mainOut.summary), clean(secOut.summary)];
-      const questions = [...mainOut.questions_for_author, ...secOut.questions_for_author].slice(0, 4).map(clean);
+      const allQuestions = [...mainOut.questions_for_author, ...secOut.questions_for_author];
+      const questions = (strict ? allQuestions : allQuestions.slice(0, 4)).map(clean);
       const passes = [mainOut.review_confidence, secOut.review_confidence].map((p) => ({ level: p.level, reason: clean(p.reason) }));
       const specNotes = clean(mainOut.spec_alignment.notes);
       if (smuggled) {
@@ -179,7 +205,7 @@ export class ReviewPipeline {
         findings: posted,
         questions,
         resolved,
-        large: ctx.large,
+        large: !strict && ctx.large,
         excluded: ctx.excluded,
         inlineFailed: false,
         jobId: job.id,
@@ -189,18 +215,26 @@ export class ReviewPipeline {
         openEarlier: previous.filter((f) => !resolvedIds.has(f.id)),
         specStatus: mainOut.spec_alignment.status,
         questions: questions.length,
-        large: ctx.large,
-        truncated: ctx.truncated,
+        large: !strict && ctx.large,
+        truncated: !strict && ctx.truncated,
+        coverageIncomplete: strict && !strictResult!.report.complete,
         injection: smuggled || placed.some((p) => p.drop_reason?.includes('exfiltration')),
         passes,
       });
       this.db.event(job.id, `Confidence ${assessment.level}${assessment.reasons.length ? `: ${assessment.reasons.join('; ')}` : ''}`);
       job = this.db.updateJob(job.id, {
-        review_body: body,
+        review_body: strictResult ? `${strictResult.report.complete ? '' : '**Review incomplete.** Unchecked areas remain; this review cannot approve the PR.\n\n'}${body}\n\n${strictResult.report.gaps.length ? `**Coverage gaps**\n${strictResult.report.gaps.map((g) => `- ${g}`).join('\n')}` : ''}` : body,
         spec_status: mainOut.spec_alignment.status,
         confidence: assessment.level,
         confidence_notes: assessment.reasons.join('\n') || null,
       });
+
+      if (strictResult) {
+        const blocks = strictApprovalBlocks(job, [...posted, ...previous.filter((f) => !resolvedIds.has(f.id))], true);
+        job = this.db.updateJob(job.id, { review_report: JSON.stringify(strictResult.report), approve_note: blocks.join('; ') || null });
+        if (strictResult.retryAt) throw new StrictReviewWaiting(strictResult.retryAt);
+        if (strictResult.report.stages.some((s) => s.error)) throw new Error('A required Strict stage failed; completed stages are saved for retry. See the coverage report for details.');
+      }
 
       if (signal.aborted) throw signal.reason;
       await this.publish(job, inserted);
@@ -210,13 +244,13 @@ export class ReviewPipeline {
     }
   }
 
-  private async checkout(job: Job, pr: PrInfo, signal: AbortSignal): Promise<Checkout> {
+  private async checkout(job: Job, pr: PrInfo, signal: AbortSignal, cfg = this.cfg): Promise<Checkout> {
     const firstTime = !(await this.cache.exists(job.repo));
     this.step(job, firstTime ? 'Downloading a local copy of the repo (first review only)' : 'Fetching new commits', 6);
     await this.cache.fetchPr(job.repo, job.pr_number, job.head_sha, pr.baseRef, pr.baseSha);
     if (signal.aborted) throw signal.reason;
     this.step(job, 'Checking out the PR', 12);
-    const checkout = await this.cache.worktree(job.repo, job.head_sha, this.cfg.keepCheckouts);
+    const checkout = await this.cache.worktree(job.repo, job.head_sha, cfg.keepCheckouts);
     if (signal.aborted) {
       await checkout.cleanup();
       throw signal.reason;
@@ -227,10 +261,22 @@ export class ReviewPipeline {
   // The review was requested again with no new commits. Nothing new is raised on code that
   // was already reviewed: each finding still open from earlier reviews is checked again
   // against the code and what was said on the PR since, and stays open or is resolved.
-  private async recheck(job: Job, pr: PrInfo, signal: AbortSignal) {
+  private async recheck(job: Job, pr: PrInfo, signal: AbortSignal, cfg = this.cfg) {
     const open = this.previousFindings(job);
     const jobs = this.db.jobsForPr(job.repo, job.pr_number);
     const last = jobs.find((j) => j.id !== job.id && j.state === 'done' && j.head_sha === job.head_sha && j.dry_run === job.dry_run);
+    const strict = readPolicy(job)?.settings.reviewProfile === 'strict';
+    if (strict) {
+      const inherited = last && readPolicy(last)?.settings.reviewProfile === 'strict' ? readReport(last) : null;
+      const report = inherited ? structuredClone(inherited) : {
+        version: POLICY_VERSION, sections: [], excluded: [], stages: [], gaps: ['No complete Strict review of this commit exists; run a full Strict review'], approvalBlocks: [], complete: false,
+      };
+      report.inheritedFrom = last?.id;
+      // Coverage gaps persist across rechecks. Finding/verification blocks are recalculated
+      // below; resolving a finding cannot manufacture missing review coverage.
+      report.approvalBlocks = report.approvalBlocks.filter((b) => !b.startsWith('Finding '));
+      this.db.updateJob(job.id, { review_report: JSON.stringify(report) });
+    }
 
     const verdicts = new Map<number, { status: 'open' | 'resolved'; reason: string }>();
     let summary = '';
@@ -240,7 +286,7 @@ export class ReviewPipeline {
       const workDir = await fs.mkdtemp(path.join(os.tmpdir(), `auto-reviewer-work-${job.id}-`));
       let checkout: Checkout | null = null;
       try {
-        checkout = await this.checkout(job, pr, signal);
+        checkout = await this.checkout(job, pr, signal, cfg);
         this.step(job, 'Reading what was said on the PR since the last review', 18);
         const owners = new Set(open.map((f) => f.job_id));
         const since = jobs.filter((j) => owners.has(j.id)).map((j) => j.created_at).sort()[0] ?? job.created_at;
@@ -269,12 +315,12 @@ export class ReviewPipeline {
         const res = await this.router.run(job.id, 'recheck', {
           cwd: checkout.dir,
           workDir,
-          timeoutMs: this.cfg.limits.passTimeoutSec * 1000,
+          timeoutMs: cfg.limits.passTimeoutSec * 1000,
           signal,
           instructions: recheckInstructions(this.gh.me),
           prompt,
           schema: recheckSchema,
-        });
+        }, { config: cfg });
         const parsed = RecheckOut.safeParse(res.output);
         if (!parsed.success) throw new Error(`the re-check returned an unexpected shape: ${parsed.error.issues[0]?.message ?? ''}`);
 
@@ -285,7 +331,21 @@ export class ReviewPipeline {
           smuggled ||= scrubbed.smuggled;
           return scrubbed.text;
         };
-        for (const v of parsed.data.verdicts) verdicts.set(v.id, { status: v.status, reason: clean(v.reason) });
+        if (strict) {
+          const report = readReport(this.db.job(job.id)!)!;
+          const missing = open.filter((f) => {
+            const entries = parsed.data.verdicts.filter((v) => v.id === f.id);
+            return entries.length !== 1 || !entries[0].reason.trim();
+          });
+          const unknown = parsed.data.verdicts.some((v) => !open.some((f) => f.id === v.id));
+          if (missing.length || unknown) {
+            report.gaps.push('Recheck returned missing, duplicate, unknown or unreasoned finding verdicts');
+            report.complete = false;
+          }
+          report.stages.push({ key: `recheck:${job.id}`, purpose: 'recheck/open-findings', provider: res.provider, model: res.model, state: missing.length || unknown ? 'incomplete' : 'done', error: null, coverage: [] });
+          this.db.updateJob(job.id, { review_report: JSON.stringify(report) });
+          for (const v of parsed.data.verdicts) if (open.some((f) => f.id === v.id) && !missing.some((f) => f.id === v.id)) verdicts.set(v.id, { status: v.status, reason: clean(v.reason) });
+        } else for (const v of parsed.data.verdicts) verdicts.set(v.id, { status: v.status, reason: clean(v.reason) });
         summary = clean(parsed.data.summary);
         pass = { level: parsed.data.review_confidence.level, reason: clean(parsed.data.review_confidence.reason) };
       } finally {
@@ -319,7 +379,7 @@ export class ReviewPipeline {
       : null;
     if (assessment) this.db.event(job.id, `Confidence ${assessment.level}${assessment.reasons.length ? `: ${assessment.reasons.join('; ')}` : ''}`);
     job = this.db.updateJob(job.id, {
-      review_body: recheckBody({ headSha: job.head_sha, summary, open: stillOpen.map(reasonOf), resolved: resolved.map(reasonOf), jobId: job.id }),
+      review_body: `${strict && !readReport(this.db.job(job.id)!)?.complete ? '**Review incomplete.** Earlier coverage gaps remain; a full Strict review is required before approval.\n\n' : ''}${recheckBody({ headSha: job.head_sha, summary, open: stillOpen.map(reasonOf), resolved: resolved.map(reasonOf), jobId: job.id })}`,
       spec_status: last?.spec_status ?? null,
       confidence: assessment ? assessment.level : (last?.confidence ?? null),
       confidence_notes: assessment ? assessment.reasons.join('\n') || null : (last?.confidence_notes ?? null),
@@ -334,7 +394,7 @@ export class ReviewPipeline {
   // is open, or for a normal review.
   private recheckHold(job: Job): { note: string; requestChanges: boolean } | null {
     if (job.kind !== 'recheck') return null;
-    const open = this.previousFindings(job);
+    const open = this.previousFindings(job, true);
     if (!open.length) return null;
     return {
       note: `${countsLine(open)} still open from earlier reviews`,
@@ -343,12 +403,14 @@ export class ReviewPipeline {
   }
 
   // Findings raised in earlier reviews of this PR that haven't been marked fixed.
-  private previousFindings(job: Job): Finding[] {
+  private previousFindings(job: Job, includePublished = false): Finding[] {
     return this.db.all<Finding>(
       `SELECT f.* FROM findings f JOIN jobs j ON j.id = f.job_id
-       WHERE j.repo = ? AND j.pr_number = ? AND j.id != ? AND j.state = 'done' AND j.dry_run = ?
-         AND f.status != 'dropped' AND f.resolved_by_job IS NULL AND COALESCE(f.outcome, '') != 'deleted'`,
-      job.repo, job.pr_number, job.id, job.dry_run,
+       WHERE j.repo = ? AND j.pr_number = ? AND j.id != ? AND j.state = 'done' AND (j.dry_run = ? OR (? = 1 AND j.dry_run = 0))
+         AND f.status != 'dropped'
+         AND (f.resolved_by_job IS NULL OR (f.resolved_by_job != ? AND NOT EXISTS (SELECT 1 FROM jobs resolved WHERE resolved.id = f.resolved_by_job AND resolved.state = 'done')))
+         AND COALESCE(f.outcome, '') != 'deleted'`,
+      job.repo, job.pr_number, job.id, job.dry_run, includePublished ? 1 : 0, job.id,
     );
   }
 
@@ -358,6 +420,7 @@ export class ReviewPipeline {
     candidates: Candidate[],
     placeOpts: Parameters<typeof placeFindings>[1],
     task: { cwd: string; workDir: string; timeoutMs: number; signal: AbortSignal },
+    cfg = this.cfg,
   ): Promise<Candidate[]> {
     // Only findings that survive the cheap checks are worth a second model's time.
     const pre = placeFindings(candidates, placeOpts);
@@ -379,7 +442,7 @@ export class ReviewPipeline {
         instructions: verifyInstructions(),
         prompt: `${ctx.prompt}\n\n## Findings to check\n\n${list}`,
         schema: verifySchema,
-      });
+      }, { config: cfg });
       const parsed = VerifyOut.safeParse(res.output);
       if (!parsed.success) throw new Error('the double-check returned an unexpected shape');
       const byId = new Map(parsed.data.verdicts.map((v) => [v.id, v]));
@@ -420,6 +483,8 @@ export class ReviewPipeline {
 
     // Last check before speaking for you: don't post on a commit that's already outdated.
     const pr = await getPr(this.gh, job.repo, job.pr_number);
+    if (pr.state !== 'open') throw new JobObsolete('PR is no longer open');
+    if (!this.cfg.isRepoAllowed(job.repo)) throw new JobObsolete('repo is no longer in your repos list');
     if (pr.headSha !== job.head_sha) throw new JobObsolete(`superseded by new commits (${pr.headSha.slice(0, 7)})`);
     await this.post(job, findings, job.mode, pr);
   }
@@ -428,18 +493,32 @@ export class ReviewPipeline {
   // before posting, against the PR as it is then.
   private async whyNotApprove(job: Job, pr: PrInfo, posted: Finding[]): Promise<string | null> {
     const { enabled, minConfidence } = this.cfg.approval;
-    if (!enabled) return 'Approving is turned off in Settings';
-    const blockers = openBlockers([...posted, ...this.previousFindings(job)]);
-    if (blockers) return `${blockers} blocker${blockers === 1 ? '' : 's'} still open`;
-    if (!job.confidence) return 'This review has no confidence level (it was made before approvals existed)';
-    if (!atLeast(job.confidence, minConfidence)) return `Confidence is ${job.confidence}; approving needs ${minConfidence}`;
-    if (pr.draft) return 'The PR is still a draft';
-    if (pr.author.toLowerCase() === this.gh.me.toLowerCase()) return "GitHub doesn't let you approve your own PR";
-    if (pr.headSha !== job.head_sha) return 'The PR has new commits since this review';
+    const frozen = readPolicy(job)?.settings.approval;
+    const reasons: string[] = [];
+    if (!enabled || frozen?.enabled === false) reasons.push('Approving is turned off in Settings');
+    const findings = [...posted, ...this.previousFindings(job, true)];
+    const blockers = openBlockers(findings);
+    if (blockers) reasons.push(`${blockers} blocker${blockers === 1 ? '' : 's'} still open`);
+    if (!job.confidence) reasons.push('This review has no confidence level (it was made before approvals existed)');
+    else if (!atLeast(job.confidence, minConfidence) || (frozen && !atLeast(job.confidence, frozen.minConfidence))) reasons.push(`Confidence is ${job.confidence}; approving needs ${minConfidence === 'high' || frozen?.minConfidence === 'high' ? 'high' : 'medium'}`);
+    reasons.push(...strictApprovalBlocks(job, findings, this.cfg.reviewProfile === 'strict'));
+    if (pr.draft) reasons.push('The PR is still a draft');
+    if (pr.author.toLowerCase() === this.gh.me.toLowerCase()) reasons.push("GitHub doesn't let you approve your own PR");
+    if (pr.headSha !== job.head_sha) reasons.push('The PR has new commits since this review');
     // A change request the app published (from a re-check) is superseded by approving; yours isn't.
     const verdict = await myVerdict(this.gh, job.repo, job.pr_number);
-    if (verdict?.state === 'CHANGES_REQUESTED' && !this.publishedByApp(verdict.reviewId)) return 'You requested changes on this PR yourself';
-    return null;
+    if (verdict?.state === 'CHANGES_REQUESTED' && !this.publishedByApp(verdict.reviewId)) reasons.push('You requested changes on this PR yourself');
+    return [...new Set(reasons)].join('; ') || null;
+  }
+
+  private async decision(job: Job, pr: PrInfo, findings: Finding[]) {
+    const hold = this.recheckHold(job);
+    const reasons = await this.whyNotApprove(job, pr, findings);
+    const strict = this.cfg.reviewProfile === 'strict' || readPolicy(job)?.settings.reviewProfile === 'strict';
+    return {
+      approveNote: strict ? [hold?.note, reasons].filter(Boolean).join('; ') || null : hold?.note ?? reasons,
+      requestChanges: hold?.requestChanges === true,
+    };
   }
 
   // Reviews you submitted from a draft are yours, even if the app wrote them.
@@ -460,9 +539,9 @@ export class ReviewPipeline {
     if (containsSecret([job.review_body ?? '', ...inline.map((c) => c.body)], ownSecrets([this.gh.token]))) {
       throw new UnsafeToPost("The review contains one of the app's own credentials, so nothing was posted. Check the PR for prompt injection.");
     }
-    const hold = this.recheckHold(job);
-    const approveNote = hold?.note ?? (await this.whyNotApprove(job, pr, posted));
-    const requestChanges = mode === 'publish' && hold?.requestChanges === true;
+    const decision = await this.decision(job, pr, posted);
+    const approveNote = decision.approveNote;
+    const requestChanges = mode === 'publish' && decision.requestChanges;
     const approve = mode === 'publish' && approveNote === null;
     const event: ReviewEvent = mode === 'draft' ? null : requestChanges ? 'REQUEST_CHANGES' : approve ? 'APPROVE' : 'COMMENT';
 
@@ -495,7 +574,7 @@ export class ReviewPipeline {
     if (requestChanges) this.db.event(job.id, `Requested changes for you: ${approveNote}`);
     else if (approve) this.db.event(job.id, `Approved the PR for you (confidence ${job.confidence})`);
     else if (mode === 'publish') this.db.event(job.id, `Not approved: ${approveNote}`);
-    else if (hold?.requestChanges) this.db.event(job.id, `${approveNote}: submit the draft as "Request changes" if you agree`);
+    else if (decision.requestChanges) this.db.event(job.id, `${approveNote}: submit the draft as "Request changes" if you agree`);
     else if (approveNote === null) this.db.event(job.id, 'No blockers and confidence is high enough: submit the draft as an approval if you agree');
   }
 
@@ -519,8 +598,7 @@ export class ReviewPipeline {
     const pr = await getPr(this.gh, job.repo, job.pr_number);
     if (pr.state !== 'open') throw new PostRefused('This PR is no longer open');
     const findings = this.db.findings(id).filter((f) => f.status !== 'dropped');
-    const hold = this.recheckHold(job);
-    const approveNote = hold?.note ?? (await this.whyNotApprove(job, pr, findings));
+    const { approveNote, requestChanges } = await this.decision(job, pr, findings);
     return {
       inline: findings.filter((f) => f.status === 'inline' && f.line !== null).length,
       inSummary: findings.filter((f) => f.status === 'summary' || (f.status === 'inline' && f.line === null)).length,
@@ -528,7 +606,7 @@ export class ReviewPipeline {
       currentSha: pr.headSha,
       defaultMode: this.cfg.modeFor(job.repo),
       approveNote,
-      requestChanges: hold?.requestChanges === true,
+      requestChanges,
       labels: { draft: this.cfg.labels.reviewing, publish: approveNote === null ? this.cfg.labels.approved : this.cfg.labels.feedback },
     };
   }

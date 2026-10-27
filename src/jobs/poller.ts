@@ -224,7 +224,25 @@ export class Poller {
     const pr = await getPr(this.gh, done.repo, done.pr_number);
     if (pr.state !== 'open') throw new Error('This PR is no longer open');
     if (pr.headSha !== done.head_sha) throw new Error(`The PR has new commits (${pr.headSha.slice(0, 7)}); review it from the queue instead`);
+    if (this.db.jobsForPr(done.repo, done.pr_number).some((j) => ACTIVE_STATES.includes(j.state))) throw new Error('This PR already has a review queued or running');
     return this.enqueueRecheck(pr, 'manual');
+  }
+
+  async fullReviewFromDashboard(id: number): Promise<Job> {
+    const previous = this.db.job(id);
+    if (!previous || ACTIVE_STATES.includes(previous.state)) throw new Error('Finish or cancel the current job before requesting a full review');
+    if (!this.cfg.isRepoAllowed(previous.repo)) throw new Error('This repo is no longer in your repos list');
+    if (this.db.jobsForPr(previous.repo, previous.pr_number).some((j) => ACTIVE_STATES.includes(j.state))) throw new Error('This PR already has a review queued or running');
+    const pr = await getPr(this.gh, previous.repo, previous.pr_number);
+    if (pr.state !== 'open') throw new Error('This PR is no longer open');
+    if (this.db.jobsForPr(previous.repo, previous.pr_number).some((j) => ACTIVE_STATES.includes(j.state))) throw new Error('This PR already has a review queued or running');
+    const job = this.db.insertJob({
+      repo: pr.repo, pr_number: pr.number, pr_title: pr.title, pr_url: pr.url, author: pr.author,
+      head_sha: pr.headSha, base_sha: pr.baseSha, since_sha: null, kind: 'audit', mode: this.cfg.modeFor(pr.repo),
+      source: 'manual', dry_run: this.cfg.dryRun ? 1 : 0, state: 'queued', additions: pr.additions, deletions: pr.deletions, changed_files: pr.changedFiles,
+    });
+    this.db.event(job.id, 'Full PR review requested from the dashboard; using the current review profile and budgets');
+    return job;
   }
 
   // Creates the job for this PR's current head commit, if there isn't one yet.

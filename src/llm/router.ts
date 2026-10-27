@@ -95,16 +95,20 @@ export class Router {
 
   // Every model run of a review goes through here: the chosen provider's models first,
   // then (if falling back is on) the other provider's.
-  async run(jobId: number, purpose: string, task: RouterTask): Promise<{ provider: Provider; model: string | null; output: unknown }> {
-    const providers = this.cfg.providerOrder();
+  async run(jobId: number, purpose: string, task: RouterTask, options: { providers?: Provider[]; config?: SettingsStore; maxJobRuns?: number } = {}): Promise<{ provider: Provider; model: string | null; output: unknown }> {
+    const cfg = options.config ?? this.cfg;
+    const providers = options.providers ?? cfg.providerOrder();
     const preferred = providers[0];
-    const firstChoice = this.cfg.modelChain(preferred)[0];
+    const firstChoice = cfg.modelChain(preferred)[0];
     let lastErr: unknown = null;
 
     for (const provider of providers) {
       if (this.providerBlockedUntil(provider)) continue;
-      for (const model of this.cfg.modelChain(provider)) {
+      for (const model of cfg.modelChain(provider)) {
         if (this.modelBlockedUntil(provider, model)) continue;
+        if (options.maxJobRuns !== undefined && this.db.runs(jobId).filter((r) => r.purpose.startsWith('strict:')).length >= options.maxJobRuns) {
+          throw new Error('Strict review model-run budget exhausted');
+        }
         const fellBack = provider !== preferred || model !== firstChoice;
         const started = Date.now();
         // Everything this run does is recorded under its key, live, for the job's page.
@@ -121,7 +125,7 @@ export class Router {
           const run = { ...task, model, onStep: step };
           const res =
             provider === 'claude'
-              ? await runClaude(run, { claudeMaxTurns: this.cfg.limits.claudeMaxTurns, claudeEffort: this.cfg.models.claudeEffort })
+              ? await runClaude(run, { claudeMaxTurns: cfg.limits.claudeMaxTurns, claudeEffort: cfg.models.claudeEffort })
               : await runCodex(run);
           const u = res.usage;
           this.db.insertRun({

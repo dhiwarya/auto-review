@@ -7,6 +7,7 @@ import { Db } from '../src/db.ts';
 import type { GitHub } from '../src/github/client.ts';
 import { PostRefused, ReviewPipeline } from '../src/review/pipeline.ts';
 import { SettingsStore } from '../src/settings.ts';
+import { POLICY_VERSION } from '../src/review/policy.ts';
 
 const REVIEWED = 'a'.repeat(40);
 
@@ -105,6 +106,59 @@ describe('posting a review', () => {
     const crash = db.findings(jobId).find((f) => f.title === 'Crash')!;
     db.updateFinding(crash.id, { severity: 'minor' });
   };
+
+  function strictReady() {
+    const settings = { ...cfg.all, reviewProfile: 'strict' as const };
+    db.updateJob(jobId, {
+      review_policy: JSON.stringify({ version: POLICY_VERSION, settings }), spec_status: 'no_spec',
+      review_report: JSON.stringify({ version: POLICY_VERSION, sections: [], excluded: [], gaps: [], approvalBlocks: [], complete: true,
+        stages: ['main/batch-1', 'security/batch-1', 'adversarial/batch-1'].map((purpose) => ({ key: purpose, purpose, state: 'done', coverage: [], provider: 'codex', model: 'm', error: null })) }),
+    });
+  }
+
+  it('uses the same Strict gates in previews and actual publishing, even after changing to Standard', async () => {
+    clearBlocker(); strictReady();
+    const f = db.findings(jobId).find((f) => f.title === 'Crash')!;
+    db.updateFinding(f.id, { severity: 'major', original_severity: 'major' });
+    cfg.update({ ...cfg.all, approval: { enabled: true, minConfidence: 'medium' } });
+    const { gh, sent } = fakeGitHub();
+    const preview = await pipeline(gh).previewPost(jobId);
+    assert.match(preview.approveNote!, /majors remain open/);
+    const posted = await pipeline(gh).postDryRun(jobId, 'publish');
+    assert.equal(sent.reviews[0].event, 'COMMENT'); assert.equal(posted.approve_note, preview.approveNote);
+  });
+
+  it('approves a complete clean Strict review, but refuses legacy reviews when Strict is selected', async () => {
+    clearBlocker(); strictReady();
+    let gh = fakeGitHub().gh;
+    assert.equal((await pipeline(gh).previewPost(jobId)).approveNote, null);
+    cfg.update({ ...cfg.all, reviewProfile: 'strict' });
+    db.updateJob(jobId, { review_policy: null, review_report: null });
+    const fake = fakeGitHub(); gh = fake.gh;
+    assert.match((await pipeline(gh).previewPost(jobId)).approveNote!, /no Strict review policy/);
+    await pipeline(gh).postDryRun(jobId, 'publish');
+    assert.equal(fake.sent.reviews[0].event, 'COMMENT');
+  });
+
+  it('preserves recorded approval restrictions and every Strict coverage reason', async () => {
+    clearBlocker(); strictReady();
+    const policy = JSON.parse(db.job(jobId)!.review_policy!); policy.settings.approval.enabled = false;
+    const report = JSON.parse(db.job(jobId)!.review_report!); report.complete = false; report.gaps = ['Security coverage missing', 'Independent provider unavailable'];
+    db.updateJob(jobId, { review_policy: JSON.stringify(policy), review_report: JSON.stringify(report) });
+    const { gh, sent } = fakeGitHub();
+    const p = await pipeline(gh).previewPost(jobId);
+    assert.match(p.approveNote!, /turned off/); assert.match(p.approveNote!, /Security coverage missing/); assert.match(p.approveNote!, /Independent provider unavailable/);
+    await pipeline(gh).postDryRun(jobId, 'publish'); assert.equal(sent.reviews[0].event, 'COMMENT');
+  });
+
+  it('counts open findings from real reviews when publishing a Strict dry run', async () => {
+    clearBlocker(); strictReady();
+    const earlier = db.insertJob({ repo: 'acme/api', pr_number: 1, pr_title: '', pr_url: '', author: 'author', head_sha: 'c'.repeat(40), base_sha: '', since_sha: null, mode: 'publish', source: 'manual', dry_run: 0, state: 'done', additions: 1, deletions: 0, changed_files: 1 });
+    db.insertFinding({ ...base, job_id: earlier.id, category: 'bug', severity: 'major', original_severity: 'major', file: 'earlier.js', line: null, title: 'Earlier real major', status: 'summary' });
+    const { gh, sent } = fakeGitHub();
+    assert.match((await pipeline(gh).previewPost(jobId)).approveNote!, /majors remain open/);
+    await pipeline(gh).postDryRun(jobId, 'publish'); assert.equal(sent.reviews[0].event, 'COMMENT');
+  });
 
   it('previews what will be posted and why it would not approve', async () => {
     const preview = await pipeline(fakeGitHub().gh).previewPost(jobId);

@@ -2,7 +2,7 @@
 
 export type Provider = 'claude' | 'codex';
 export type ReviewMode = 'draft' | 'publish';
-export type Pass = 'main' | 'security';
+export type Pass = 'main' | 'security' | 'adversarial';
 
 export type JobState =
   | 'queued'
@@ -18,7 +18,7 @@ export const ACTIVE_STATES: JobState[] = ['queued', 'running', 'waiting'];
 // review: reads the code (all of it, or the commits since the last review).
 // recheck: the review was requested again with no new commits, so it re-checks the
 // findings still open from earlier reviews instead of reviewing the code again.
-export type JobKind = 'review' | 'recheck';
+export type JobKind = 'review' | 'recheck' | 'audit';
 
 export type Severity = 'blocker' | 'major' | 'minor' | 'nit';
 export const SEVERITIES: Severity[] = ['blocker', 'major', 'minor', 'nit'];
@@ -75,6 +75,39 @@ export interface Job {
   updated_at: string;
   // Filled in by list queries.
   counts?: Record<Severity, number>;
+  review_policy?: string | null;
+  review_report?: string | null;
+}
+
+export interface StrictCoverage {
+  section_id: string;
+  status: 'examined' | 'unverified';
+  dependencies: string[];
+  tests: string[];
+  configuration: string[];
+  notes: string;
+}
+
+export interface StrictStage {
+  key: string;
+  purpose: string;
+  provider: Provider | null;
+  model: string | null;
+  state: 'done' | 'incomplete';
+  error: string | null;
+  coverage: StrictCoverage[];
+}
+
+export interface StrictReport {
+  version: number;
+  sections: { id: string; file: string }[];
+  excluded: string[];
+  stages: StrictStage[];
+  gaps: string[];
+  approvalBlocks: string[];
+  complete: boolean;
+  inheritedFrom?: number;
+  requirements?: { stage: string; ref: string; status: string; reason: string }[];
 }
 
 export interface Finding {
@@ -207,6 +240,7 @@ export interface ProviderStatus {
 }
 
 export interface ReviewerSettings {
+  profile?: 'standard' | 'strict';
   provider: Provider;
   fallbackToOther: boolean;
   doubleCheck: boolean;

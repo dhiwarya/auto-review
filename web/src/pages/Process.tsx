@@ -1,5 +1,5 @@
 import { useState, type ReactNode } from 'react';
-import type { Evidence, EvidenceFile, Finding, Job, JobDetail, Run, Step, StepKind } from '../../../src/types.ts';
+import type { Evidence, EvidenceFile, Finding, Job, JobDetail, Run, Step, StepKind, StrictReport } from '../../../src/types.ts';
 import { getJson } from '../api.ts';
 import { compact, duration, shortSha } from '../ui.tsx';
 
@@ -427,6 +427,9 @@ export function ProcessView({ detail }: { detail: JobDetail }) {
   const evidenceState: StageState = evidence ? 'done' : active ? (job.state === 'running' ? 'running' : 'pending') : 'skipped';
   const posting = postingState(job);
   let n = 1;
+  let strict: StrictReport | null = null;
+  try { strict = JSON.parse(job.review_report ?? 'null'); } catch { /* old job */ }
+  const strictPurposes = [...new Set([...runs.map((r) => r.purpose), ...steps.map((s) => s.purpose)].filter((p) => p.startsWith('strict:')))];
 
   return (
     <ol className="process">
@@ -438,10 +441,26 @@ export function ProcessView({ detail }: { detail: JobDetail }) {
         )}
       </Stage>
 
+      {strict && <Stage n={n++} title="Strict coverage and approval gates" state={strict.complete ? 'done' : active ? 'running' : 'failed'}>
+        <p className="small">{strict.complete ? 'Required coverage and stages completed.' : 'Review incomplete.'} {strict.sections.length} assigned diff sections; {strict.excluded.length} excluded files. {strict.inheritedFrom ? `Baseline: job ${strict.inheritedFrom}.` : ''}</p>
+        <p className="small muted">Diff inclusion, model-reported examination, and recorded tool activity are separate evidence. They do not prove understanding.</p>
+        {[...new Set([...strict.gaps, ...strict.approvalBlocks])].length > 0 && <ul className="plain-list small">{[...new Set([...strict.gaps, ...strict.approvalBlocks])].map((g) => <li key={g}>{g}</li>)}</ul>}
+        {(strict.requirements?.length ?? 0) > 0 && <details className="small"><summary>Requirement assessments</summary>{strict.requirements!.map((r, i) => <p key={i}><strong>{r.ref}: {r.status}</strong> ({r.stage}) — {r.reason}</p>)}</details>}
+        {strict.stages.map((s) => <details key={s.key} className="small"><summary>{s.purpose}: {s.state} · {s.provider ?? 'no provider completed'}{s.model ? ` ${s.model}` : ''}</summary>
+          {s.error && <p className="error">{s.error}</p>}
+          {s.coverage.map((c) => <div key={c.section_id}><strong>{c.section_id}: {c.status}</strong><p>{c.notes}</p><p className="muted">Dependencies: {c.dependencies.join(', ') || 'none reported'} · Tests: {c.tests.join(', ') || 'none reported'} · Configuration: {c.configuration.join(', ') || 'none reported'}</p></div>)}
+        </details>)}
+      </Stage>}
+
       {job.kind === 'recheck' ? (
         <Stage n={n++} title="Re-check of open findings" state={passState(attempts('recheck'), active)}>
           <PassCard title="Re-check" attempts={attempts('recheck')} jobActive={active} emptyNote="No findings were open, so no model ran." />
         </Stage>
+      ) : strict ? (
+        <>
+          {strictPurposes.map((p) => <Stage key={p} n={n++} title={p.split(':').slice(1, -1).join(' / ')} state={passState(attempts(p), active)}><PassCard title="Model activity and usage" attempts={attempts(p)} jobActive={active} emptyNote="Waiting for this stage." /></Stage>)}
+          <Stage n={n++} title="Checking findings against the code" state={findings.length || job.state === 'done' ? 'done' : 'pending'}><ValidationBody findings={findings} /></Stage>
+        </>
       ) : (
         <>
           <Stage n={n++} title="Review" state={mergeStates(passState(attempts('main'), active), passState(attempts('security'), active))} meta="both run at the same time">
