@@ -1,13 +1,13 @@
 import { SettingsSchema, type Settings } from '../settings-schema.ts';
 import type { Finding, Job, StrictReport } from '../types.ts';
 
-export const POLICY_VERSION = 1;
+export const POLICY_VERSION = 2;
 export interface ReviewPolicy { version: number; settings: Settings }
 
 export function readPolicy(job: Job): ReviewPolicy | null {
   try {
     const raw = JSON.parse(job.review_policy ?? 'null');
-    if (raw?.version !== POLICY_VERSION) return null;
+    if (raw?.version !== POLICY_VERSION && raw?.version !== 1) return null;
     return { version: raw.version, settings: SettingsSchema.parse(raw.settings) };
   } catch { return null; }
 }
@@ -15,8 +15,17 @@ export function readPolicy(job: Job): ReviewPolicy | null {
 export function readReport(job: Job): StrictReport | null {
   try {
     const r = JSON.parse(job.review_report ?? 'null');
-    return r?.version === POLICY_VERSION && Array.isArray(r.stages) && Array.isArray(r.gaps) && Array.isArray(r.approvalBlocks) ? r : null;
+    return (r?.version === POLICY_VERSION || r?.version === 1) && Array.isArray(r.stages) && Array.isArray(r.gaps) && Array.isArray(r.approvalBlocks) ? r : null;
   } catch { return null; }
+}
+
+export function hasStrictCoverage(job: Job | undefined): boolean {
+  const policy = job && readPolicy(job);
+  if (!job || policy?.version !== POLICY_VERSION || policy.settings.reviewProfile !== 'strict') return false;
+  const report = readReport(job);
+  return !!report && report.version === POLICY_VERSION && report.complete && !report.gaps.length
+    && ['main/', 'security/', 'adversarial/'].every((purpose) => report.stages.some((s) => s.purpose.startsWith(purpose) && s.state === 'done'))
+    && report.stages.every((s) => s.state === 'done');
 }
 
 export function strictApprovalBlocks(job: Job, findings: Finding[], currentlyStrict = false): string[] {
@@ -27,6 +36,7 @@ export function strictApprovalBlocks(job: Job, findings: Finding[], currentlyStr
   const report = readReport(job);
   if (!report) blocks.push('Strict coverage and completion records are missing');
   else {
+    if (report.version !== POLICY_VERSION) blocks.push('This review predates complete-context Strict coverage; run a full Strict review');
     blocks.push(...report.gaps, ...report.approvalBlocks);
     if (!report.complete && !report.gaps.length) blocks.push('Strict review is incomplete');
     for (const purpose of ['main/', 'security/', 'adversarial/']) {

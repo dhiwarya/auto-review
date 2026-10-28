@@ -43,9 +43,7 @@ function fakeGitHub(opts: FakeOpts = {}) {
     rateLimits: new Map(),
     octokit: {
       paginate: async (fn: (p: unknown) => Promise<{ data: unknown[] }>, params: unknown) => (await fn(params)).data,
-      graphql: async () => {
-        throw new Error('no graphql here');
-      },
+      graphql: async () => ({ repository: { pullRequest: { closingIssuesReferences: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } } }),
       rest: {
         pulls: {
           get: async () => ({
@@ -228,9 +226,18 @@ describe('re-checking open findings', () => {
     const { gh, sent } = fakeGitHub(opts);
     const prompts: string[] = [];
     const router = {
-      run: async (_job: number, purpose: string, task: { prompt: string }) => {
-        assert.equal(purpose, 'recheck');
+      run: async (_job: number, purpose: string, task: { prompt: string }, options?: { providers?: ('codex' | 'claude')[] }) => {
         prompts.push(task.prompt);
+        if (cfg.reviewProfile === 'strict') {
+          assert.match(purpose, /^strict:/);
+          return { provider: options?.providers?.[0] ?? 'codex', model: 'm', output: {
+            summary: 'Rechecked the previously raised findings.', findings: [], questions_for_author: [], requirements: [],
+            resolved_previous_ids: verdicts.filter((v) => v.status === 'resolved' && verdicts.filter((other) => other.id === v.id).length === 1 && v.reason.trim()).map((v) => v.id),
+            spec_alignment: { status: 'no_spec', notes: '' }, review_confidence: { level: 'high', reason: 'Read the code and full discussion.' },
+            coverage: [...task.prompt.matchAll(/^## Assigned section (.+)$/gm)].map((m) => ({ section_id: m[1], status: 'examined', dependencies: [], tests: [], configuration: [], notes: 'Read the assigned code or context; no further files apply.' })),
+          } };
+        }
+        assert.equal(purpose, 'recheck');
         return { provider: 'codex', model: 'm', output: { summary: 'Still not safe.', verdicts, review_confidence: { level: 'high', reason: 'Read it all.' } } };
       },
     };
@@ -238,13 +245,14 @@ describe('re-checking open findings', () => {
       exists: async () => true,
       fetchPr: async () => {},
       worktree: async () => ({ dir, cleanup: async () => {} }),
+      mergeBase: async () => jobRow.base_sha, history: async () => [], readFile: async () => null,
     };
     const job = db.insertJob({ ...jobRow, kind: 'recheck', since_sha: HEAD, mode });
     await new ReviewPipeline(gh, cfg, db, router as never, cache as never).run(job, new AbortController().signal);
     return { sent, prompts, job: db.job(job.id)!, events: db.events(job.id).map((e) => e.message) };
   }
 
-  it('preserves earlier Strict coverage gaps even when every finding is resolved', async () => {
+  it('repairs earlier Strict coverage gaps with a full-context recheck before approving', async () => {
     cfg.update({ ...cfg.all, reviewProfile: 'strict' });
     db.updateJob(earlier.id, {
       review_policy: JSON.stringify({ version: POLICY_VERSION, settings: cfg.all }),
@@ -254,13 +262,13 @@ describe('re-checking open findings', () => {
       { id: blocker.id, status: 'resolved', reason: 'Read a.js; the failure cannot occur.' },
       { id: minor.id, status: 'resolved', reason: 'Read b.js; handled by its caller.' },
     ]);
-    assert.equal(sent.reviews[0].event, 'COMMENT');
-    assert.match(job.approve_note!, /earlier diff section/);
-    assert.match(job.review_body!, /Review incomplete/);
-    assert.equal(JSON.parse(job.review_report!).inheritedFrom, earlier.id);
+    assert.equal(sent.reviews[0].event, 'APPROVE');
+    assert.equal(job.approve_note, null);
+    assert.match(job.review_body!, /Review complete/);
+    assert.match(JSON.parse(job.review_report!).recovery, new RegExp(`job ${earlier.id}`));
   });
 
-  it('does not let duplicate Strict recheck verdicts resolve an open finding', async () => {
+  it('keeps an earlier finding open when the full Strict recheck does not confirm its resolution', async () => {
     cfg.update({ ...cfg.all, reviewProfile: 'strict' });
     const { sent, job } = await recheck([
       { id: blocker.id, status: 'open', reason: 'The bug remains.' },
@@ -269,7 +277,7 @@ describe('re-checking open findings', () => {
     ]);
     assert.equal(sent.reviews[0].event, 'REQUEST_CHANGES');
     assert.equal(db.findings(earlier.id).find((f) => f.id === blocker.id)!.resolved_by_job, null);
-    assert.match(job.approve_note!, /duplicate/);
+    assert.match(job.approve_note!, /blocker/);
   });
 
   it('requests changes while a blocker is still open, and resolves what no longer holds', async () => {

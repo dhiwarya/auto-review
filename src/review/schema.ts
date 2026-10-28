@@ -141,8 +141,8 @@ const coverageJson = {
   },
 };
 const requirementJson = {
-  type: 'object', additionalProperties: false, required: ['ref', 'status', 'reason'],
-  properties: { ref: str, status: enumOf(['aligned', 'partial', 'misaligned', 'not_checked']), reason: str },
+  type: 'object', additionalProperties: false, required: ['ref', 'criterion', 'status', 'reason', 'scope_evidence'],
+  properties: { ref: str, criterion: str, status: enumOf(['implemented', 'missing', 'deferred', 'out_of_scope', 'externally_unverifiable', 'not_checked']), reason: str, scope_evidence: str },
 };
 export const strictReviewSchema = {
   ...reviewSchema,
@@ -152,12 +152,19 @@ export const strictReviewSchema = {
     requirements: { type: 'array', items: requirementJson },
   },
 };
+export function strictSchemaForIssues(refs: string[]) {
+  return { ...strictReviewSchema, properties: { ...strictReviewSchema.properties,
+    requirements: { type: 'array', ...(!refs.length ? { maxItems: 0 } : {}), items: { ...requirementJson,
+      properties: { ...requirementJson.properties, ref: refs.length ? enumOf(refs) : str },
+    } },
+  } };
+}
 export const StrictReviewOut = ReviewOut.extend({
   coverage: z.array(z.object({
     section_id: z.string(), status: z.enum(['examined', 'unverified']),
     dependencies: z.array(z.string()), tests: z.array(z.string()), configuration: z.array(z.string()), notes: z.string(),
   })),
-  requirements: z.array(z.object({ ref: z.string(), status: z.enum(['aligned', 'partial', 'misaligned', 'not_checked']), reason: z.string() })),
+  requirements: z.array(z.object({ ref: z.string(), criterion: z.string(), status: z.enum(['implemented', 'missing', 'deferred', 'out_of_scope', 'externally_unverifiable', 'not_checked']), reason: z.string(), scope_evidence: z.string() })),
 });
 export type StrictReviewOut = z.infer<typeof StrictReviewOut>;
 

@@ -6,7 +6,7 @@ import { NoProviderAvailable } from '../llm/router.ts';
 import { JobObsolete, UnsafeToPost, type ReviewPipeline } from '../review/pipeline.ts';
 import { bus } from '../bus.ts';
 import type { Job } from '../types.ts';
-import { StrictReviewWaiting } from '../review/strict.ts';
+import { StrictReviewWaiting, StrictReviewIncomplete } from '../review/strict.ts';
 
 const minutesFromNow = (m: number) => new Date(Date.now() + m * 60_000).toISOString();
 
@@ -108,7 +108,7 @@ export class Worker {
       await this.pipeline.labelCancelled(job).catch(() => {});
       return;
     }
-    if (err instanceof UnsafeToPost) {
+    if (err instanceof UnsafeToPost || err instanceof StrictReviewIncomplete) {
       this.db.event(id, message, 'error');
       this.db.setState(id, 'failed', { error: message, step: 'Failed' });
       await this.pipeline.labelFailed(job).catch(() => {});

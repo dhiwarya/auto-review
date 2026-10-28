@@ -29,8 +29,17 @@ export class SettingsStore {
     this.data = SettingsStore.defaults();
     const raw = snapshot ? JSON.stringify(snapshot) : db.getKv(KEY);
     if (raw) {
-      const parsed = SettingsSchema.safeParse(JSON.parse(raw));
-      if (parsed.success) this.data = parsed.data;
+      const input = JSON.parse(raw);
+      const upgrade = !snapshot && input.strict && input.strict.maxContinuations === undefined;
+      if (upgrade) {
+        if (input.strict.maxBatches === 8) input.strict.maxBatches = 16;
+        if (input.strict.maxRuns === 32) input.strict.maxRuns = 64;
+      }
+      const parsed = SettingsSchema.safeParse(input);
+      if (parsed.success) {
+        this.data = parsed.data;
+        if (upgrade) db.setKv(KEY, JSON.stringify(this.data));
+      }
       else console.error('[settings] stored settings are invalid; using defaults until they are saved again', parsed.error.issues);
     }
     this.compile();

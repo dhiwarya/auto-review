@@ -148,7 +148,8 @@ describe('posting a review', () => {
     const { gh, sent } = fakeGitHub();
     const p = await pipeline(gh).previewPost(jobId);
     assert.match(p.approveNote!, /turned off/); assert.match(p.approveNote!, /Security coverage missing/); assert.match(p.approveNote!, /Independent provider unavailable/);
-    await pipeline(gh).postDryRun(jobId, 'publish'); assert.equal(sent.reviews[0].event, 'COMMENT');
+    await assert.rejects(pipeline(gh).postDryRun(jobId, 'publish'), /explicitly choose/i);
+    await pipeline(gh).postDryRun(jobId, 'publish', true); assert.equal(sent.reviews[0].event, 'COMMENT');
   });
 
   it('counts open findings from real reviews when publishing a Strict dry run', async () => {

@@ -136,52 +136,65 @@ const ISSUE_REF = /(?:^|[\s(,])(?:([\w.-]+\/[\w.-]+))?#(\d+)\b|https:\/\/github\
 
 // Issues the PR closes (GitHub's own link), plus issues and other PRs mentioned in the
 // description. Only issues go into the prompt; the PRs are shown as evidence.
-export async function getLinkedRefs(gh: GitHub, pr: PrInfo, limit = 5): Promise<{ issues: LinkedIssue[]; prs: LinkedPr[] }> {
+export async function getLinkedRefs(gh: GitHub, pr: PrInfo, limit = 5, complete = false): Promise<{ issues: LinkedIssue[]; prs: LinkedPr[]; gaps: string[] }> {
   const refs = new Map<string, { repo: string; number: number; linkedBy: LinkedIssue['linkedBy'] }>();
+  const gaps: string[] = [];
   const { owner, repo: name } = splitRepo(pr.repo);
 
   try {
-    const res = await gh.octokit.graphql<{
-      repository: { pullRequest: { closingIssuesReferences: { nodes: { number: number; repository: { nameWithOwner: string } }[] } } };
-    }>(
-      `query($owner: String!, $name: String!, $number: Int!) {
+    let cursor: string | null = null;
+    const seenCursors = new Set<string>();
+    do {
+      const res: { repository: { pullRequest: { closingIssuesReferences: { nodes: { number: number; repository: { nameWithOwner: string } }[]; pageInfo?: { hasNextPage: boolean; endCursor: string | null } } } } } = await gh.octokit.graphql(
+      `query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
         repository(owner: $owner, name: $name) {
           pullRequest(number: $number) {
-            closingIssuesReferences(first: 10) { nodes { number repository { nameWithOwner } } }
+            closingIssuesReferences(first: 100, after: $cursor) { nodes { number repository { nameWithOwner } } pageInfo { hasNextPage endCursor } }
           }
         }
       }`,
-      { owner, name, number: pr.number },
+      { owner, name, number: pr.number, cursor },
     );
-    for (const n of res.repository.pullRequest.closingIssuesReferences.nodes) {
+    const connection = res.repository.pullRequest.closingIssuesReferences;
+    for (const n of connection.nodes) {
       refs.set(`${n.repository.nameWithOwner}#${n.number}`, { repo: n.repository.nameWithOwner, number: n.number, linkedBy: 'closes' });
     }
+    if (!complete || !connection.pageInfo?.hasNextPage) break;
+    const next = connection.pageInfo.endCursor;
+    if (!next || seenCursors.has(next)) throw new Error('closing-issue pagination did not advance');
+    seenCursors.add(next);
+    cursor = next;
+    } while (true);
   } catch {
     // GraphQL can be unavailable for some tokens; description references still work.
+    if (complete) gaps.push('Could not retrieve all closing-issue references from GitHub');
   }
 
   for (const m of pr.body.matchAll(ISSUE_REF)) {
     const repo = m[3] ?? m[1] ?? pr.repo;
     const number = Number(m[4] ?? m[2]);
     const key = `${repo}#${number}`;
-    if (number && number !== pr.number && !refs.has(key)) refs.set(key, { repo, number, linkedBy: 'mentioned' });
+    if (number && !refs.has(key)) refs.set(key, { repo, number, linkedBy: 'mentioned' });
   }
 
   const issues: LinkedIssue[] = [];
   const prs: LinkedPr[] = [];
-  for (const ref of [...refs.values()].slice(0, limit * 2)) {
-    if (issues.length >= limit) break;
+  for (const ref of complete ? refs.values() : [...refs.values()].slice(0, limit * 2)) {
+    if (!complete && issues.length >= limit) break;
     try {
       const { data } = await gh.octokit.rest.issues.get({ ...splitRepo(ref.repo), issue_number: ref.number });
       if (data.pull_request) {
         prs.push({ repo: ref.repo, number: ref.number, title: data.title, url: data.html_url });
         continue;
       }
-      const { data: comments } = await gh.octokit.rest.issues.listComments({
+      const params = {
         ...splitRepo(ref.repo),
         issue_number: ref.number,
-        per_page: 10,
-      });
+        per_page: complete ? 100 : 10,
+      };
+      const comments = complete
+        ? await gh.octokit.paginate(gh.octokit.rest.issues.listComments, params)
+        : (await gh.octokit.rest.issues.listComments(params)).data;
       issues.push({
         repo: ref.repo,
         number: ref.number,
@@ -193,7 +206,8 @@ export async function getLinkedRefs(gh: GitHub, pr: PrInfo, limit = 5): Promise<
       });
     } catch {
       // No access to that repo, or the number isn't an issue. Skip it.
+      if (complete) gaps.push(`Could not retrieve the complete issue and comments for ${ref.repo}#${ref.number}`);
     }
   }
-  return { issues, prs };
+  return { issues, prs, gaps };
 }

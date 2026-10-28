@@ -17,8 +17,9 @@ import { countsLine, inlineBody, recheckBody, summaryBody } from './format.ts';
 import { mainInstructions, recheckInstructions, securityInstructions, verifyInstructions } from './prompts.ts';
 import { RecheckOut, recheckSchema, ReviewOut, reviewSchema, VerifyOut, verifySchema } from './schema.ts';
 import { addedTextOf, lowerSeverity, minSeverity, placeFindings, scrubText, type Candidate } from './validate.ts';
-import { POLICY_VERSION, readPolicy, readReport, strictApprovalBlocks } from './policy.ts';
-import { runStrictReview, StrictReviewWaiting } from './strict.ts';
+import { POLICY_VERSION, hasStrictCoverage, readPolicy, readReport, strictApprovalBlocks } from './policy.ts';
+import { runStrictReview, StrictReviewWaiting, StrictReviewIncomplete } from './strict.ts';
+import { materializeSources } from './sources.ts';
 
 // The job no longer needs doing: PR closed, or new commits replaced it.
 export class JobObsolete extends Error {}
@@ -56,8 +57,16 @@ export class ReviewPipeline {
     if (pr.headSha !== job.head_sha) throw new JobObsolete(`superseded by new commits (${pr.headSha.slice(0, 7)})`);
     this.db.updateJob(job.id, { pr_title: pr.title, additions: pr.additions, deletions: pr.deletions, changed_files: pr.changedFiles });
     if (!job.review_policy) job = this.db.updateJob(job.id, { review_policy: JSON.stringify({ version: POLICY_VERSION, settings: this.cfg.all }) });
-    const policy = readPolicy(job);
+    let policy = readPolicy(job);
     if (!policy) throw new Error('Unknown review policy; this job cannot be resumed safely');
+    if (policy.settings.reviewProfile === 'strict' && policy.version < POLICY_VERSION && !job.review_id) {
+      const upgraded = structuredClone(policy.settings);
+      if (upgraded.strict.maxBatches === 8) upgraded.strict.maxBatches = 16;
+      if (upgraded.strict.maxRuns === 32) upgraded.strict.maxRuns = 64;
+      job = this.db.updateJob(job.id, { review_policy: JSON.stringify({ version: POLICY_VERSION, settings: upgraded, previousPolicy: policy }), since_sha: null, review_body: null, review_report: null });
+      this.db.event(job.id, 'Upgraded Strict completion policy; restarting with full PR coverage');
+      policy = readPolicy(job)!;
+    }
     const frozen = structuredClone(policy.settings);
     const strict = frozen.reviewProfile === 'strict';
     if (strict) {
@@ -67,6 +76,16 @@ export class ReviewPipeline {
       frozen.models.claudeEffort = frozen.strict.claudeEffort;
     }
     const cfg = this.cfg.snapshot(frozen);
+    let recovery = readReport(job)?.recovery;
+    if (strict && !recovery && (job.since_sha || job.kind === 'recheck')) {
+      const baseline = this.db.jobsForPr(job.repo, job.pr_number).find((j) => j.id !== job.id && j.state === 'done' && j.dry_run === job.dry_run && j.head_sha === (job.kind === 'recheck' ? job.head_sha : job.since_sha));
+      const priorUncertainty = baseline && hasStrictCoverage(baseline) && readReport(baseline)?.approvalBlocks.some((reason) => reason === 'Unresolved questions affect review confidence' || reason === 'A required pass reported less than high confidence');
+      if (!hasStrictCoverage(baseline) || priorUncertainty) {
+        recovery = `Automatically expanded to the full current PR: ${priorUncertainty ? `job ${baseline!.id} has earlier questions or code uncertainty that must be reassessed` : baseline ? `job ${baseline.id} lacks complete current-policy Strict coverage` : 'no complete Strict baseline exists'}`;
+        job = this.db.updateJob(job.id, { since_sha: null, review_body: null });
+        this.db.event(job.id, recovery);
+      }
+    }
 
     // A retry after "pending review exists" only needs to post what was already prepared.
     if (job.review_body && !job.review_id && !job.dry_run && (!strict || readReport(job)?.complete)) {
@@ -76,7 +95,7 @@ export class ReviewPipeline {
     if (strict) this.db.run('UPDATE findings SET resolved_by_job = NULL WHERE resolved_by_job = ?', job.id);
 
     await this.labelStart(job, pr);
-    if (job.kind === 'recheck') return this.recheck(job, pr, signal, cfg);
+    if (job.kind === 'recheck' && !strict) return this.recheck(job, pr, signal, cfg);
 
     const workDir = await fs.mkdtemp(path.join(os.tmpdir(), `auto-reviewer-work-${job.id}-`));
     let checkout: Checkout | null = null;
@@ -85,7 +104,18 @@ export class ReviewPipeline {
 
       this.step(job, 'Reading the PR, linked issues and guidelines', 18);
       const previous = this.previousFindings(job);
-      const ctx = await buildContext(this.gh, cfg, pr, job.since_sha, previous, this.cache);
+      const priorJob = strict ? this.db.jobsForPr(job.repo, job.pr_number).find((j) => j.id !== job.id && j.state === 'done' && j.dry_run === job.dry_run) : null;
+      const ctx = await buildContext(this.gh, cfg, pr, job.since_sha, previous, this.cache, {
+        snapshot: strict ? this.db.contextSnapshot(job.id) : null,
+        recheckOnly: strict && job.kind === 'recheck',
+        priorReview: priorJob?.review_body && priorJob.confidence !== 'high' ? { id: priorJob.id, text: `${priorJob.confidence_notes ?? ''}\n\n${priorJob.review_body}` } : undefined,
+      });
+      ctx.recovery = recovery;
+      ctx.recheckOnly = strict && job.kind === 'recheck';
+      if (ctx.sourceSnapshot) {
+        this.db.saveContextSnapshot(job.id, ctx.sourceSnapshot);
+        await materializeSources(ctx.sourceSnapshot, checkout.dir);
+      }
       this.db.setEvidence(job.id, ctx.evidence);
       this.db.event(
         job.id,
@@ -195,7 +225,7 @@ export class ReviewPipeline {
       if (smuggled) {
         this.db.event(job.id, 'A model put a credential that is not in the PR into its summary or questions. It was redacted; check the PR for prompt injection.', 'warn');
       }
-      const body = summaryBody({
+      const body = ctx.recheckOnly ? `${strictResult!.report.complete ? '**Review complete.**' : '**Review incomplete.**'}\n\n${recheckBody({ headSha: job.head_sha, summary: summaries.filter(Boolean).join('\n\n'), open: previous.filter((f) => !resolvedIds.has(f.id)).map((finding) => ({ finding, reason: '' })), resolved: resolved.map((finding) => ({ finding, reason: '' })), jobId: job.id })}` : summaryBody({
         repo: job.repo,
         headSha: job.head_sha,
         summaries,
@@ -209,6 +239,7 @@ export class ReviewPipeline {
         excluded: ctx.excluded,
         inlineFailed: false,
         jobId: job.id,
+        complete: strictResult?.report.complete,
       });
       const assessment = assess({
         findings: posted,
@@ -223,7 +254,7 @@ export class ReviewPipeline {
       });
       this.db.event(job.id, `Confidence ${assessment.level}${assessment.reasons.length ? `: ${assessment.reasons.join('; ')}` : ''}`);
       job = this.db.updateJob(job.id, {
-        review_body: strictResult ? `${strictResult.report.complete ? '' : '**Review incomplete.** Unchecked areas remain; this review cannot approve the PR.\n\n'}${body}\n\n${strictResult.report.gaps.length ? `**Coverage gaps**\n${strictResult.report.gaps.map((g) => `- ${g}`).join('\n')}` : ''}` : body,
+        review_body: strictResult ? `${body}\n\n${strictResult.report.gaps.length ? `**Coverage gaps**\n${strictResult.report.gaps.map((g) => `- ${g}`).join('\n')}` : ''}` : body,
         spec_status: mainOut.spec_alignment.status,
         confidence: assessment.level,
         confidence_notes: assessment.reasons.join('\n') || null,
@@ -234,6 +265,8 @@ export class ReviewPipeline {
         job = this.db.updateJob(job.id, { review_report: JSON.stringify(strictResult.report), approve_note: blocks.join('; ') || null });
         if (strictResult.retryAt) throw new StrictReviewWaiting(strictResult.retryAt);
         if (strictResult.report.stages.some((s) => s.error)) throw new Error('A required Strict stage failed; completed stages are saved for retry. See the coverage report for details.');
+        if (ctx.contextGaps?.length) throw new Error(`Strict context retrieval is incomplete: ${ctx.contextGaps.join('; ')}`);
+        if (!strictResult.report.complete) throw new StrictReviewIncomplete(`Strict review did not complete within its recovery budget. Nothing was posted. ${strictResult.report.gaps.join('; ')}. Use Full PR review with suitable budgets or explicitly post a partial review.`);
       }
 
       if (signal.aborted) throw signal.reason;
@@ -265,18 +298,6 @@ export class ReviewPipeline {
     const open = this.previousFindings(job);
     const jobs = this.db.jobsForPr(job.repo, job.pr_number);
     const last = jobs.find((j) => j.id !== job.id && j.state === 'done' && j.head_sha === job.head_sha && j.dry_run === job.dry_run);
-    const strict = readPolicy(job)?.settings.reviewProfile === 'strict';
-    if (strict) {
-      const inherited = last && readPolicy(last)?.settings.reviewProfile === 'strict' ? readReport(last) : null;
-      const report = inherited ? structuredClone(inherited) : {
-        version: POLICY_VERSION, sections: [], excluded: [], stages: [], gaps: ['No complete Strict review of this commit exists; run a full Strict review'], approvalBlocks: [], complete: false,
-      };
-      report.inheritedFrom = last?.id;
-      // Coverage gaps persist across rechecks. Finding/verification blocks are recalculated
-      // below; resolving a finding cannot manufacture missing review coverage.
-      report.approvalBlocks = report.approvalBlocks.filter((b) => !b.startsWith('Finding '));
-      this.db.updateJob(job.id, { review_report: JSON.stringify(report) });
-    }
 
     const verdicts = new Map<number, { status: 'open' | 'resolved'; reason: string }>();
     let summary = '';
@@ -331,21 +352,7 @@ export class ReviewPipeline {
           smuggled ||= scrubbed.smuggled;
           return scrubbed.text;
         };
-        if (strict) {
-          const report = readReport(this.db.job(job.id)!)!;
-          const missing = open.filter((f) => {
-            const entries = parsed.data.verdicts.filter((v) => v.id === f.id);
-            return entries.length !== 1 || !entries[0].reason.trim();
-          });
-          const unknown = parsed.data.verdicts.some((v) => !open.some((f) => f.id === v.id));
-          if (missing.length || unknown) {
-            report.gaps.push('Recheck returned missing, duplicate, unknown or unreasoned finding verdicts');
-            report.complete = false;
-          }
-          report.stages.push({ key: `recheck:${job.id}`, purpose: 'recheck/open-findings', provider: res.provider, model: res.model, state: missing.length || unknown ? 'incomplete' : 'done', error: null, coverage: [] });
-          this.db.updateJob(job.id, { review_report: JSON.stringify(report) });
-          for (const v of parsed.data.verdicts) if (open.some((f) => f.id === v.id) && !missing.some((f) => f.id === v.id)) verdicts.set(v.id, { status: v.status, reason: clean(v.reason) });
-        } else for (const v of parsed.data.verdicts) verdicts.set(v.id, { status: v.status, reason: clean(v.reason) });
+        for (const v of parsed.data.verdicts) verdicts.set(v.id, { status: v.status, reason: clean(v.reason) });
         summary = clean(parsed.data.summary);
         pass = { level: parsed.data.review_confidence.level, reason: clean(parsed.data.review_confidence.reason) };
       } finally {
@@ -379,7 +386,7 @@ export class ReviewPipeline {
       : null;
     if (assessment) this.db.event(job.id, `Confidence ${assessment.level}${assessment.reasons.length ? `: ${assessment.reasons.join('; ')}` : ''}`);
     job = this.db.updateJob(job.id, {
-      review_body: `${strict && !readReport(this.db.job(job.id)!)?.complete ? '**Review incomplete.** Earlier coverage gaps remain; a full Strict review is required before approval.\n\n' : ''}${recheckBody({ headSha: job.head_sha, summary, open: stillOpen.map(reasonOf), resolved: resolved.map(reasonOf), jobId: job.id })}`,
+      review_body: recheckBody({ headSha: job.head_sha, summary, open: stillOpen.map(reasonOf), resolved: resolved.map(reasonOf), jobId: job.id }),
       spec_status: last?.spec_status ?? null,
       confidence: assessment ? assessment.level : (last?.confidence ?? null),
       confidence_notes: assessment ? assessment.reasons.join('\n') || null : (last?.confidence_notes ?? null),
@@ -474,6 +481,7 @@ export class ReviewPipeline {
   }
 
   private async publish(job: Job, findings: Finding[]) {
+    if (readPolicy(job)?.settings.reviewProfile === 'strict' && (!readReport(job)?.complete || readReport(job)?.version !== POLICY_VERSION)) throw new StrictReviewIncomplete('Strict coverage is incomplete; automatic posting is disabled');
     if (job.dry_run) {
       const inline = findings.filter((f) => f.status === 'inline' && f.line !== null).length;
       this.step(job, `Dry run: not posted. Ready to post a ${job.mode} review with ${inline} inline comment(s)`, 100);
@@ -530,7 +538,10 @@ export class ReviewPipeline {
   // pending reviews only you can see; published reviews approve the PR when nothing stands
   // in the way, request changes when a re-check finds blockers or majors still open, and
   // comment otherwise.
-  private async post(job: Job, findings: Finding[], mode: ReviewMode, pr: PrInfo) {
+  private async post(job: Job, findings: Finding[], mode: ReviewMode, pr: PrInfo, allowPartial = false) {
+    const strict = readPolicy(job)?.settings.reviewProfile === 'strict';
+    const partial = strict && (!readReport(job)?.complete || readReport(job)?.version !== POLICY_VERSION);
+    if (partial && !allowPartial) throw new PostRefused('This Strict review is incomplete. Explicitly choose to post a partial review, or finish a full review first.');
     const posted = findings.filter((f) => f.status !== 'dropped');
     const inline: InlineComment[] = posted
       .filter((f) => f.status === 'inline' && f.line !== null)
@@ -541,13 +552,20 @@ export class ReviewPipeline {
     }
     const decision = await this.decision(job, pr, posted);
     const approveNote = decision.approveNote;
-    const requestChanges = mode === 'publish' && decision.requestChanges;
-    const approve = mode === 'publish' && approveNote === null;
+    const requestChanges = !partial && mode === 'publish' && decision.requestChanges;
+    const approve = !partial && mode === 'publish' && approveNote === null;
     const event: ReviewEvent = mode === 'draft' ? null : requestChanges ? 'REQUEST_CHANGES' : approve ? 'APPROVE' : 'COMMENT';
 
     const doing = mode === 'draft' ? 'Posting draft review (only you can see it)' : requestChanges ? 'Requesting changes' : approve ? 'Approving the PR' : 'Posting review comment';
     this.step(job, doing, 95);
-    const res = await postReview(this.gh, job.repo, job.pr_number, job.head_sha, event, job.review_body ?? '', inline);
+    let body = job.review_body ?? '';
+    if (strict) {
+      if (partial) body = body.replace(/\*\*No issues found\.\*\*/g, '**No new findings in the reviewed sections.**').replace('this result is retained locally until recovery completes.', 'posted explicitly as a partial review; unchecked areas remain.');
+      const verdict = approveNote ? `**Approval withheld:** ${approveNote}` : '**Approval checks passed.**';
+      body = body.replace(SIGNATURE, `${verdict}\n\n${SIGNATURE}`);
+    }
+    if (containsSecret([body, ...inline.map((c) => c.body)], ownSecrets([this.gh.token]))) throw new UnsafeToPost("The final review contains one of the app's own credentials, so nothing was posted.");
+    const res = await postReview(this.gh, job.repo, job.pr_number, job.head_sha, event, body, inline);
     if (res.droppedInline) {
       this.db.event(job.id, 'GitHub rejected an inline comment position, so every finding went into the review body instead', 'warn');
       for (const f of inline) this.db.updateFinding(f.findingId, { status: 'summary' });
@@ -565,6 +583,7 @@ export class ReviewPipeline {
       review_id: res.id,
       review_url: res.url,
       review_state: res.state,
+      review_body: body,
       approve_note: approveNote,
       label_ok: labelOk ? 1 : 0,
       progress: 100,
@@ -585,8 +604,9 @@ export class ReviewPipeline {
   private postable(id: number): Job {
     const job = this.db.job(id);
     if (!job) throw new PostRefused('Review not found');
-    if (!job.dry_run || job.review_id) throw new PostRefused('This review is already on GitHub');
-    if (job.state !== 'done' || job.review_state !== 'DRY_RUN') throw new PostRefused('Only finished dry-run reviews can be posted');
+    if (job.review_id) throw new PostRefused('This review is already on GitHub');
+    const partial = readPolicy(job)?.settings.reviewProfile === 'strict' && !readReport(job)?.complete && job.review_body && ['failed', 'cancelled'].includes(job.state);
+    if (!partial && (!job.dry_run || job.state !== 'done' || job.review_state !== 'DRY_RUN')) throw new PostRefused('Only finished dry runs or stopped incomplete Strict reviews can be posted');
     if (!this.cfg.isRepoAllowed(job.repo)) throw new PostRefused('This repo is no longer in your repos list');
     if (this.posting.has(id)) throw new PostRefused('Already posting this review');
     return job;
@@ -599,6 +619,7 @@ export class ReviewPipeline {
     if (pr.state !== 'open') throw new PostRefused('This PR is no longer open');
     const findings = this.db.findings(id).filter((f) => f.status !== 'dropped');
     const { approveNote, requestChanges } = await this.decision(job, pr, findings);
+    const partial = readPolicy(job)?.settings.reviewProfile === 'strict' && (!readReport(job)?.complete || readReport(job)?.version !== POLICY_VERSION);
     return {
       inline: findings.filter((f) => f.status === 'inline' && f.line !== null).length,
       inSummary: findings.filter((f) => f.status === 'summary' || (f.status === 'inline' && f.line === null)).length,
@@ -606,12 +627,13 @@ export class ReviewPipeline {
       currentSha: pr.headSha,
       defaultMode: this.cfg.modeFor(job.repo),
       approveNote,
-      requestChanges,
+      requestChanges: !partial && requestChanges,
+      partial,
       labels: { draft: this.cfg.labels.reviewing, publish: approveNote === null ? this.cfg.labels.approved : this.cfg.labels.feedback },
     };
   }
 
-  async postDryRun(id: number, mode: ReviewMode): Promise<Job> {
+  async postDryRun(id: number, mode: ReviewMode, allowPartial = false): Promise<Job> {
     const job = this.postable(id);
     this.posting.add(id);
     try {
@@ -625,11 +647,11 @@ export class ReviewPipeline {
           'warn',
         );
       }
-      await this.post(job, this.db.findings(id), mode, pr);
+      await this.post(job, this.db.findings(id), mode, pr, allowPartial);
       return this.db.job(id)!;
     } catch (err) {
       // Put the review back as it was, ready to try again.
-      this.db.updateJob(id, { step: 'Dry run: not posted', progress: 100 });
+      this.db.updateJob(id, { step: job.step, progress: job.progress });
       if (err instanceof PendingReviewExists) {
         throw new PostRefused('You already have an unsubmitted review on this PR. Submit or discard it on GitHub, then try again.');
       }

@@ -49,9 +49,9 @@ describe('Strict review', () => {
   afterEach(() => { db.sql.close(); fs.rmSync(dir, { recursive: true, force: true }); });
 
   function mockRouter(change?: (purpose: string, output: any, task: RouterTask) => void, unavailable?: () => boolean) {
-    const calls: { purpose: string; provider: Provider; prompt: string }[] = [];
-    const router = { run: async (id: number, purpose: string, task: RouterTask, options: { providers: Provider[] }) => {
-      const provider = options.providers[0]; calls.push({ purpose, provider, prompt: task.prompt });
+    const calls: { purpose: string; provider: Provider; prompt: string; attemptCap?: number }[] = [];
+    const router = { run: async (id: number, purpose: string, task: RouterTask, options: { providers: Provider[]; maxJobRuns?: number }) => {
+      const provider = options.providers[0]; calls.push({ purpose, provider, prompt: task.prompt, attemptCap: options.maxJobRuns });
       if (purpose.startsWith('strict:adversarial:') && unavailable?.()) throw new NoProviderAvailable(new Date(Date.now() + 60_000));
       let output: any;
       if (purpose.startsWith('strict:verify:')) {
@@ -59,13 +59,13 @@ describe('Strict review', () => {
         output = { verdicts: [{ id: Number(match[1]), verdict: 'confirmed', adjusted_severity: 'major', reason: 'Checked a.js and confirmed the zero limit.' }] };
       } else {
         const ids = [...task.prompt.matchAll(/^## Assigned section (.+)$/gm)].map((m) => m[1]);
-        if (purpose.startsWith('strict:synthesis:')) ids.push(...ctx.reviewFiles.flatMap(() => makeBatches(ctx, cfg).sections.map((s) => s.id)));
+        if (purpose.includes(':all-batches:')) ids.push(...makeBatches(ctx, cfg).sections.map((s) => s.id));
         output = {
           summary: 'The changed paths were inspected.', findings: [], questions_for_author: [], resolved_previous_ids: [],
           spec_alignment: { status: ctx.issues.length ? 'aligned' : 'no_spec', notes: '' },
           review_confidence: { level: 'high', reason: 'Read the relevant code.' },
           coverage: ids.map((id) => ({ section_id: id, status: 'examined', dependencies: ['a.js'], tests: [], configuration: [], notes: 'Read a.js; no tests or configuration apply to this expression.' })),
-          requirements: ctx.issues.map((i) => ({ ref: `${i.repo}#${i.number}`, status: 'aligned', reason: 'The requested behavior is present.' })),
+          requirements: ctx.issues.map((i) => ({ ref: `${i.repo}#${i.number}`, criterion: i.body, status: 'implemented', reason: 'The requested behavior is present.', scope_evidence: '' })),
         };
       }
       change?.(purpose, output, task);
@@ -80,7 +80,7 @@ describe('Strict review', () => {
     assert.equal(SettingsStore.defaults().reviewProfile, 'standard');
     const snapshot = cfg.snapshot();
     cfg.update({ ...cfg.all, reviewProfile: 'standard', strict: { ...cfg.strict, maxRuns: 5 } });
-    assert.equal(snapshot.reviewProfile, 'strict'); assert.equal(snapshot.strict.maxRuns, 32);
+    assert.equal(snapshot.reviewProfile, 'strict'); assert.equal(snapshot.strict.maxRuns, 64);
   });
   it('requires independent providers and never shows the adversarial pass other findings', async () => {
     const { router, calls } = mockRouter((purpose, out) => { if (purpose.startsWith('strict:main:')) out.summary = 'UNIQUE_FIRST_PASS_RESULT'; });
@@ -90,6 +90,111 @@ describe('Strict review', () => {
     assert.ok(!calls[2].prompt.includes('UNIQUE_FIRST_PASS_RESULT'));
     job = db.updateJob(job.id, { review_report: JSON.stringify(result.report) });
     assert.deepEqual(strictApprovalBlocks(job, [], true), []);
+  });
+  it('continues only missing sections and merges them with completed coverage', async () => {
+    ctx.reviewFiles[0].patch += '\n@@ -5 +5 @@\n-oldAgain();\n+newAgain();';
+    const { router, calls } = mockRouter((p, o) => {
+      if (p.startsWith('strict:main:') && !p.includes(':continuation-')) o.coverage.pop();
+    });
+    const result = await run(router);
+    assert.equal(result.report.complete, true);
+    const continuation = calls.find((c) => c.purpose.includes(':continuation-'))!;
+    assert.ok(continuation); assert.equal([...continuation.prompt.matchAll(/^## Assigned section /gm)].length, 1);
+    assert.equal(result.report.stages.find((s) => s.purpose === 'main/batch-1')!.coverage.length, 2);
+    assert.equal(result.report.stages.find((s) => s.purpose === 'main/batch-1')!.continuations, 1);
+    assert.equal(calls.filter((c) => c.purpose.startsWith('strict:security:')).length, 1);
+    assert.equal(calls.filter((c) => c.purpose.startsWith('strict:adversarial:')).length, 1);
+  });
+  it('does not treat literal truncation-looking repository text as a lost source', async () => {
+    ctx.contextPrompt = 'Repository documentation says [truncated 100 chars] in an example.';
+    const result = await run(mockRouter().router);
+    assert.equal(result.report.complete, true); assert.deepEqual(result.report.gaps, []);
+  });
+  it('continues an unfinished requirement checklist and separates missing requirements from missing review coverage', async () => {
+    ctx.issues = [{ repo: 'acme/api', number: 9, title: 'Requirement', body: 'Persist the receipt.', url: '', comments: [], linkedBy: 'closes' }];
+    const { router, calls } = mockRouter((p, o) => {
+      if (p.startsWith('strict:main:') && !p.includes(':continuation-')) o.requirements[0].status = 'not_checked';
+    });
+    const result = await run(router);
+    assert.equal(result.report.complete, true); assert.equal(result.mainOut.spec_alignment.status, 'aligned');
+    assert.ok(calls.some((c) => c.purpose.includes(':continuation-')));
+    assert.ok(result.report.requirements!.every((r) => r.status === 'implemented'));
+  });
+  it('completes the job-61 comment citation pattern without wasting continuation attempts', async () => {
+    const criterion = 'Client-side token fetching can be disabled by defining `BUILDKIT_NO_CLIENT_TOKEN=1`.';
+    ctx.issues = [{ repo: 'moby/buildkit', number: 4725, title: 'Registry auth', body: 'Authentication fails behind a proxy.', url: '', comments: Array.from({ length: 11 }, () => ({ author: 'maintainer', body: criterion })), linkedBy: 'mentioned' }];
+    const { router, calls } = mockRouter((p, o, task) => {
+      const schema = task.schema as any;
+      assert.deepEqual(schema.properties.requirements.items.properties.ref.enum, ['moby/buildkit#4725']);
+      if (p.startsWith('strict:security:')) { o.requirements = []; return; }
+      o.requirements = [{ ref: 'moby/buildkit#4725:comment-11', criterion, status: 'implemented', reason: 'The image sets the variable and the fixture checks its behavior.', scope_evidence: '' }];
+    });
+    const result = await run(router);
+    assert.equal(result.report.complete, true); assert.deepEqual(result.report.gaps, []);
+    assert.equal(calls.length, 3); assert.deepEqual(result.report.approvalBlocks, []);
+    assert.ok(result.report.requirements!.every((r) => r.ref === 'moby/buildkit#4725'));
+  });
+  it('repairs malformed refs with exact diagnostics without repeating completed code coverage', async () => {
+    ctx.issues = [{ repo: 'acme/api', number: 9, title: 'Requirement', body: 'Persist the receipt.', url: '', comments: [], linkedBy: 'closes' }];
+    const { router, calls } = mockRouter((p, o, task) => {
+      if (!p.startsWith('strict:main:')) return;
+      if (!p.includes(':continuation-')) o.requirements[0].ref = 'acme/api#9:comment-999';
+      else {
+        assert.match(task.prompt, /Unknown issue ref acme\/api#9:comment-999/);
+        assert.match(task.prompt, /Missing assessment for acme\/api#9/);
+        assert.equal([...task.prompt.matchAll(/^## Assigned section /gm)].length, 0);
+        o.requirements[0].status = 'missing';
+      }
+    });
+    const result = await run(router);
+    assert.equal(result.report.complete, true); assert.equal(calls.length, 4);
+    assert.equal(result.report.stages[0].coverage.length, 1);
+    assert.ok(result.report.approvalBlocks.some((b) => b.includes('is missing')));
+    assert.equal(result.mainOut.spec_alignment.status, 'partial');
+    assert.ok(result.report.requirements!.every((r) => r.ref === 'acme/api#9'));
+  });
+  it('keeps truly unfinished requirement assessments incomplete with actionable reasons', async () => {
+    ctx.issues = [{ repo: 'acme/api', number: 9, title: 'Requirement', body: 'Persist the receipt.', url: '', comments: [], linkedBy: 'closes' }];
+    const { router } = mockRouter((p, o) => { if (p.startsWith('strict:main:')) o.requirements[0].status = 'not_checked'; });
+    const result = await run(router);
+    assert.equal(result.report.complete, false);
+    assert.ok(result.report.gaps.some((g) => g.includes('Unfinished assessment for acme/api#9: Persist the receipt.')));
+  });
+  it('requires an explicit consolidated verdict after conflicting parent and comment assessments', async () => {
+    ctx.issues = [{ repo: 'acme/api', number: 9, title: 'Requirement', body: 'Persist the receipt.', url: '', comments: [{ author: 'a', body: 'Persist the receipt.' }], linkedBy: 'closes' }];
+    const { router } = mockRouter((p, o) => {
+      if (!p.startsWith('strict:main:')) return;
+      if (!p.includes(':continuation-')) o.requirements.push({ ...o.requirements[0], ref: 'acme/api#9:comment-1', status: 'missing' });
+      else o.requirements = [];
+    });
+    const result = await run(router);
+    assert.equal(result.report.complete, false);
+    assert.ok(result.report.gaps.some((g) => g.includes('Unfinished assessment for acme/api#9')));
+  });
+  it('accepts a complete medium-confidence baseline without treating known findings as missing coverage', async () => {
+    const baseline = db.insertJob({ ...jobRow, head_sha: 'c'.repeat(40), state: 'done' });
+    db.updateJob(baseline.id, { confidence: 'medium', review_policy: job.review_policy, review_report: JSON.stringify(completeReport()) });
+    ctx.incremental = true; ctx.evidence.diff!.sinceSha = baseline.head_sha;
+    const result = await run(mockRouter().router);
+    assert.equal(result.report.complete, true); assert.equal(result.report.inheritedFrom, baseline.id);
+  });
+  it('reserves future discovery, synthesis and verification capacity before allowing continuation work', async () => {
+    const { router, calls } = mockRouter((p, o) => { if (p.startsWith('strict:main:')) o.findings = [finding]; });
+    await run(router);
+    assert.deepEqual(calls.map((c) => c.attemptCap), [54, 55, 56, 64]);
+  });
+  it('rejects an oversized planned workload before starting discovery', async () => {
+    cfg.update({ ...cfg.all, strict: { ...cfg.strict, maxDiffChars: 20000, maxRuns: 3 } });
+    ctx.reviewFiles[0].patch = '@@ -1 +1,30 @@\n' + '+'.padEnd(1000, 'x').concat('\n').repeat(30);
+    const { router, calls } = mockRouter(); const result = await run(router);
+    assert.equal(calls.length, 0); assert.equal(result.report.complete, false);
+    assert.ok(result.report.gaps.some((g) => g.includes('Planned workload')));
+  });
+  it('raises no new findings when refreshing full coverage for a same-commit recheck', async () => {
+    ctx.recheckOnly = true;
+    const { router, calls } = mockRouter((p, o) => { if (p.startsWith('strict:main:')) o.findings = [finding]; });
+    const result = await run(router);
+    assert.deepEqual(result.candidates, []); assert.equal(calls.length, 3);
   });
   it('keeps coverage incomplete despite high confidence when a section is missing or unverified', async () => {
     const { router } = mockRouter((p, o) => { if (p.startsWith('strict:security:')) o.coverage = []; });
@@ -153,7 +258,7 @@ describe('Strict review', () => {
   });
   it('requires explicit linked-issue assessment and keeps reviewer disagreement visible', async () => {
     ctx.issues = [{ repo: 'acme/api', number: 9, title: 'Requirement', body: 'Keep results', url: '', comments: [], linkedBy: 'closes' }];
-    const { router } = mockRouter((p, o) => { if (p.startsWith('strict:adversarial:')) o.requirements[0].status = 'partial'; });
+    const { router } = mockRouter((p, o) => { if (p.startsWith('strict:adversarial:')) o.requirements[0].status = 'missing'; });
     const result = await run(router);
     assert.equal(result.mainOut.spec_alignment.status, 'partial');
     assert.ok(result.report.approvalBlocks.some((b) => b.includes('disagreement')));
@@ -171,10 +276,11 @@ describe('Strict review', () => {
     ctx.reviewFiles[0].patch = '@@ -1 +1,18 @@\n' + '+'.padEnd(1000, 'x').concat('\n').repeat(18);
     ctx.large = true;
     const { router, calls } = mockRouter((p, o) => {
-      if (p.startsWith('strict:main:')) o.findings = [{ ...finding, severity: 'minor' }];
+      if (p.startsWith('strict:main:')) { o.findings = [{ ...finding, severity: 'minor' }]; o.summary = 'PRIMARY_ONLY_ASSESSMENT'; }
     });
     const result = await run(router);
     assert.ok(calls.some((c) => c.purpose.startsWith('strict:synthesis:')));
+    assert.ok(!calls.find((c) => c.purpose.startsWith('strict:adversarial:all-batches:'))!.prompt.includes('PRIMARY_ONLY_ASSESSMENT'));
     assert.equal(result.report.complete, true); assert.ok(result.candidates.some((c) => c.severity === 'minor'));
   });
   it('does not approve an incremental review with an incomplete or Standard baseline', async () => {

@@ -146,11 +146,11 @@ export async function startServer(deps: Deps) {
     }
   });
 
-  app.post<{ Params: { id: string }; Body: { mode?: string } }>('/api/jobs/:id/post', async (req, reply) => {
+  app.post<{ Params: { id: string }; Body: { mode?: string; allowPartial?: boolean } }>('/api/jobs/:id/post', async (req, reply) => {
     const mode = req.body?.mode;
     if (mode !== 'draft' && mode !== 'publish') return reply.code(400).send({ error: 'mode must be draft or publish' });
     try {
-      return await deps.pipeline.postDryRun(Number(req.params.id), mode);
+      return await deps.pipeline.postDryRun(Number(req.params.id), mode, req.body?.allowPartial === true);
     } catch (err) {
       return reply.code(err instanceof PostRefused ? 409 : 500).send({ error: err instanceof Error ? err.message : String(err) });
     }

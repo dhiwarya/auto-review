@@ -96,6 +96,7 @@ export interface StrictStage {
   state: 'done' | 'incomplete';
   error: string | null;
   coverage: StrictCoverage[];
+  continuations?: number;
 }
 
 export interface StrictReport {
@@ -107,7 +108,10 @@ export interface StrictReport {
   approvalBlocks: string[];
   complete: boolean;
   inheritedFrom?: number;
-  requirements?: { stage: string; ref: string; status: string; reason: string }[];
+  requirements?: { stage: string; ref: string; status: string; reason: string; criterion?: string; scopeEvidence?: string }[];
+  recovery?: string;
+  workload?: { plannedDiscoveryRuns: number; synthesisRuns: number; verificationReserve: number; maxRuns: number };
+  sources?: { id: string; title: string; kind: string; chars: number; digest: string; sections: number }[];
 }
 
 export interface Finding {
@@ -168,6 +172,7 @@ export interface Evidence {
   previousFindings: number;
   discussion: { threadReplies: number; conversation: number } | null; // re-checks only
   promptChars: number;
+  contextGaps?: string[];
 }
 
 // reviewed: its diff is in the prompt. too_long: the diff didn't fit, the model was told
@@ -310,5 +315,6 @@ export interface PostPreview {
   // requestChanges is set (a re-check with blockers or majors still open).
   approveNote: string | null;
   requestChanges: boolean;
+  partial?: boolean;
   labels: Record<ReviewMode, string>;
 }
